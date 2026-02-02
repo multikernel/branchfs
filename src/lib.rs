@@ -6,5 +6,8 @@ pub mod inode;
 pub mod state;
 pub mod storage;
 
-pub use daemon::{Daemon, Request, Response, send_request, is_daemon_running, start_daemon_background, ensure_daemon};
+pub use daemon::{
+    ensure_daemon, is_daemon_running, send_request, start_daemon_background, Daemon, Request,
+    Response,
+};
 pub use error::{BranchError, Result};

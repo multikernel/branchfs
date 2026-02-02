@@ -58,13 +58,16 @@ impl BranchFs {
     /// Switch to a different branch (used after commit/abort to switch to main)
     fn switch_to_branch(&self, new_branch: &str) {
         *self.branch_name.write() = new_branch.to_string();
-        self.current_epoch.store(self.manager.get_epoch(), Ordering::SeqCst);
+        self.current_epoch
+            .store(self.manager.get_epoch(), Ordering::SeqCst);
         // Clear inode cache since we're on a different branch now
         self.inodes.clear();
     }
 
     fn resolve(&self, path: &str) -> Option<std::path::PathBuf> {
-        self.manager.resolve_path(&self.get_branch_name(), path).ok()?
+        self.manager
+            .resolve_path(&self.get_branch_name(), path)
+            .ok()?
     }
 
     fn make_attr(&self, ino: u64, path: &Path) -> Option<FileAttr> {
@@ -108,15 +111,13 @@ impl BranchFs {
         if !delta.exists() {
             if let Some(src) = self.resolve(rel_path) {
                 if src.exists() && src.is_file() {
-                    storage::copy_file(&src, &delta).map_err(|e| {
-                        std::io::Error::other(e.to_string())
-                    })?;
+                    storage::copy_file(&src, &delta)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
                 }
             }
         }
 
-        storage::ensure_parent_dirs(&delta)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        storage::ensure_parent_dirs(&delta).map_err(|e| std::io::Error::other(e.to_string()))?;
 
         Ok(delta)
     }
@@ -276,8 +277,6 @@ impl Filesystem for BranchFs {
             return;
         }
 
-        
-
         let path = match self.inodes.get_path(ino) {
             Some(p) => p,
             None => {
@@ -375,8 +374,6 @@ impl Filesystem for BranchFs {
             return;
         }
 
-        
-
         let path = match self.inodes.get_path(ino) {
             Some(p) => p,
             None => {
@@ -433,8 +430,6 @@ impl Filesystem for BranchFs {
             reply.error(libc::ESTALE);
             return;
         }
-
-        
 
         let path = match self.inodes.get_path(ino) {
             Some(p) => p,
@@ -524,8 +519,6 @@ impl Filesystem for BranchFs {
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
-        
-
         let parent_path = match self.inodes.get_path(parent) {
             Some(p) => p,
             None => {
@@ -566,8 +559,6 @@ impl Filesystem for BranchFs {
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        
-
         let parent_path = match self.inodes.get_path(parent) {
             Some(p) => p,
             None => {
@@ -610,8 +601,6 @@ impl Filesystem for BranchFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        
-
         let parent_path = match self.inodes.get_path(parent) {
             Some(p) => p,
             None => {
@@ -672,7 +661,8 @@ impl Filesystem for BranchFs {
 
         if self.resolve(&path).is_some() {
             // Register this inode for cache invalidation tracking
-            self.manager.register_opened_inode(&self.get_branch_name(), ino);
+            self.manager
+                .register_opened_inode(&self.get_branch_name(), ino);
             reply.opened(0, 0);
         } else {
             reply.error(libc::ENOENT);
@@ -697,8 +687,6 @@ impl Filesystem for BranchFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        
-
         let path = match self.inodes.get_path(ino) {
             Some(p) => p,
             None => {

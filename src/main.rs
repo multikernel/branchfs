@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use anyhow::Result;
@@ -97,11 +97,11 @@ enum Commands {
     },
 }
 
-fn get_socket_path(storage: &PathBuf) -> PathBuf {
+fn get_socket_path(storage: &Path) -> PathBuf {
     storage.join("daemon.sock")
 }
 
-fn send_request(storage: &PathBuf, request: &Request) -> Result<Response> {
+fn send_request(storage: &Path, request: &Request) -> Result<Response> {
     let socket_path = get_socket_path(storage);
     daemon::send_request(&socket_path, request)
         .map_err(|e| anyhow::anyhow!("Failed to communicate with daemon: {}", e))
@@ -112,7 +112,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Mount { base, storage, mountpoint } => {
+        Commands::Mount {
+            base,
+            storage,
+            mountpoint,
+        } => {
             std::fs::create_dir_all(&storage)?;
             let storage = storage.canonicalize()?;
 
@@ -120,7 +124,7 @@ fn main() -> Result<()> {
             let base = base.map(|b| b.canonicalize()).transpose()?;
 
             // Ensure daemon is running (auto-start if needed)
-            daemon::ensure_daemon(base.as_ref(), &storage)
+            daemon::ensure_daemon(base.as_deref(), &storage)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
             // Create mountpoint
@@ -128,10 +132,13 @@ fn main() -> Result<()> {
             let mountpoint = mountpoint.canonicalize()?;
 
             // Send mount request (always mounts main branch)
-            let response = send_request(&storage, &Request::Mount {
-                branch: "main".to_string(),
-                mountpoint: mountpoint.to_string_lossy().to_string(),
-            })?;
+            let response = send_request(
+                &storage,
+                &Request::Mount {
+                    branch: "main".to_string(),
+                    mountpoint: mountpoint.to_string_lossy().to_string(),
+                },
+            )?;
 
             if response.ok {
                 println!("Mounted at {:?}", mountpoint);
@@ -141,17 +148,24 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Create { name, parent, storage, mount } => {
+        Commands::Create {
+            name,
+            parent,
+            storage,
+            mount,
+        } => {
             let storage = storage.canonicalize()?;
 
             // Ensure daemon is running
-            daemon::ensure_daemon(None, &storage)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            daemon::ensure_daemon(None, &storage).map_err(|e| anyhow::anyhow!("{}", e))?;
 
-            let response = send_request(&storage, &Request::Create {
-                name: name.clone(),
-                parent: parent.clone(),
-            })?;
+            let response = send_request(
+                &storage,
+                &Request::Create {
+                    name: name.clone(),
+                    parent: parent.clone(),
+                },
+            )?;
 
             if response.ok {
                 println!("Created branch '{}' with parent '{}'", name, parent);
@@ -165,16 +179,25 @@ fn main() -> Result<()> {
                     let mut file = std::fs::OpenOptions::new()
                         .write(true)
                         .open(&ctl_path)
-                        .map_err(|e| anyhow::anyhow!("Failed to open control file (is {} mounted?): {}", mountpoint.display(), e))?;
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to open control file (is {} mounted?): {}",
+                                mountpoint.display(),
+                                e
+                            )
+                        })?;
 
                     file.write_all(format!("switch:{}", name).as_bytes())
                         .map_err(|e| anyhow::anyhow!("Failed to switch to branch: {}", e))?;
 
                     // Notify daemon of the switch
-                    let _ = send_request(&storage, &Request::NotifySwitch {
-                        mountpoint: mountpoint.to_string_lossy().to_string(),
-                        branch: name.clone(),
-                    });
+                    let _ = send_request(
+                        &storage,
+                        &Request::NotifySwitch {
+                            mountpoint: mountpoint.to_string_lossy().to_string(),
+                            branch: name.clone(),
+                        },
+                    );
 
                     println!("Switched to branch '{}' at {:?}", name, mountpoint);
                 }
@@ -184,7 +207,10 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Commit { mountpoint, storage } => {
+        Commands::Commit {
+            mountpoint,
+            storage,
+        } => {
             let mountpoint = mountpoint.canonicalize()?;
             let storage = storage.canonicalize()?;
             let ctl_path = mountpoint.join(".branchfs_ctl");
@@ -198,15 +224,21 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("Commit failed: {}", e))?;
 
             // Notify daemon that we've switched to main
-            let _ = send_request(&storage, &Request::NotifySwitch {
-                mountpoint: mountpoint.to_string_lossy().to_string(),
-                branch: "main".to_string(),
-            });
+            let _ = send_request(
+                &storage,
+                &Request::NotifySwitch {
+                    mountpoint: mountpoint.to_string_lossy().to_string(),
+                    branch: "main".to_string(),
+                },
+            );
 
             println!("Committed branch at {:?}", mountpoint);
         }
 
-        Commands::Abort { mountpoint, storage } => {
+        Commands::Abort {
+            mountpoint,
+            storage,
+        } => {
             let mountpoint = mountpoint.canonicalize()?;
             let storage = storage.canonicalize()?;
             let ctl_path = mountpoint.join(".branchfs_ctl");
@@ -220,10 +252,13 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("Abort failed: {}", e))?;
 
             // Notify daemon that we've switched to main
-            let _ = send_request(&storage, &Request::NotifySwitch {
-                mountpoint: mountpoint.to_string_lossy().to_string(),
-                branch: "main".to_string(),
-            });
+            let _ = send_request(
+                &storage,
+                &Request::NotifySwitch {
+                    mountpoint: mountpoint.to_string_lossy().to_string(),
+                    branch: "main".to_string(),
+                },
+            );
 
             println!("Aborted branch at {:?}", mountpoint);
         }
@@ -232,8 +267,7 @@ fn main() -> Result<()> {
             let storage = storage.canonicalize()?;
 
             // Ensure daemon is running
-            daemon::ensure_daemon(None, &storage)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            daemon::ensure_daemon(None, &storage).map_err(|e| anyhow::anyhow!("{}", e))?;
 
             let response = send_request(&storage, &Request::List)?;
 
@@ -256,13 +290,19 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Unmount { mountpoint, storage } => {
+        Commands::Unmount {
+            mountpoint,
+            storage,
+        } => {
             let storage = storage.canonicalize()?;
             let mountpoint = mountpoint.canonicalize()?;
 
-            let response = send_request(&storage, &Request::Unmount {
-                mountpoint: mountpoint.to_string_lossy().to_string(),
-            })?;
+            let response = send_request(
+                &storage,
+                &Request::Unmount {
+                    mountpoint: mountpoint.to_string_lossy().to_string(),
+                },
+            )?;
 
             if response.ok {
                 println!("Unmounted {:?}", mountpoint);

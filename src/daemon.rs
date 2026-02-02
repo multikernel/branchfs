@@ -37,15 +37,27 @@ pub struct Response {
 
 impl Response {
     pub fn success() -> Self {
-        Self { ok: true, error: None, data: None }
+        Self {
+            ok: true,
+            error: None,
+            data: None,
+        }
     }
 
     pub fn success_with_data(data: serde_json::Value) -> Self {
-        Self { ok: true, error: None, data: Some(data) }
+        Self {
+            ok: true,
+            error: None,
+            data: Some(data),
+        }
     }
 
     pub fn error(msg: &str) -> Self {
-        Self { ok: false, error: Some(msg.to_string()), data: None }
+        Self {
+            ok: false,
+            error: Some(msg.to_string()),
+            data: None,
+        }
     }
 }
 
@@ -58,7 +70,11 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new(base_path: PathBuf, storage_path: PathBuf, workspace_path: PathBuf) -> Result<Self> {
-        let manager = Arc::new(BranchManager::new(storage_path.clone(), base_path, workspace_path)?);
+        let manager = Arc::new(BranchManager::new(
+            storage_path.clone(),
+            base_path,
+            workspace_path,
+        )?);
         let socket_path = storage_path.join("daemon.sock");
 
         Ok(Self {
@@ -77,25 +93,32 @@ impl Daemon {
         self.manager.clone()
     }
 
-    pub fn spawn_mount(&self, branch_name: &str, mountpoint: &PathBuf) -> Result<()> {
+    pub fn spawn_mount(&self, branch_name: &str, mountpoint: &Path) -> Result<()> {
         let fs = BranchFs::new(self.manager.clone(), branch_name.to_string());
         let options = vec![MountOption::FSName("branchfs".to_string())];
 
-        log::info!("Spawning mount for branch '{}' at {:?}", branch_name, mountpoint);
+        log::info!(
+            "Spawning mount for branch '{}' at {:?}",
+            branch_name,
+            mountpoint
+        );
 
-        let session = fuser::spawn_mount2(fs, mountpoint, &options)
-            .map_err(crate::error::BranchError::Io)?;
+        let session =
+            fuser::spawn_mount2(fs, mountpoint, &options).map_err(crate::error::BranchError::Io)?;
 
         // Get the notifier for cache invalidation and register it with the manager
         let notifier = Arc::new(session.notifier());
-        self.manager.register_notifier(branch_name, mountpoint.clone(), notifier);
+        self.manager
+            .register_notifier(branch_name, mountpoint.to_path_buf(), notifier);
 
-        self.mounts.lock().insert(mountpoint.clone(), (session, branch_name.to_string()));
+        self.mounts
+            .lock()
+            .insert(mountpoint.to_path_buf(), (session, branch_name.to_string()));
 
         Ok(())
     }
 
-    pub fn unmount(&self, mountpoint: &PathBuf) -> Result<()> {
+    pub fn unmount(&self, mountpoint: &Path) -> Result<()> {
         let (should_shutdown, branch_name) = {
             let mut mounts = self.mounts.lock();
             if let Some((_, branch_name)) = mounts.remove(mountpoint) {
@@ -103,7 +126,10 @@ impl Daemon {
                 // The BackgroundSession drop will handle FUSE cleanup
                 (mounts.is_empty(), Some(branch_name))
             } else {
-                return Err(crate::error::BranchError::NotFound(format!("{:?}", mountpoint)));
+                return Err(crate::error::BranchError::NotFound(format!(
+                    "{:?}",
+                    mountpoint
+                )));
             }
         };
 
@@ -144,10 +170,11 @@ impl Daemon {
             std::fs::remove_file(&self.socket_path)?;
         }
 
-        let listener = UnixListener::bind(&self.socket_path)
-            .map_err(crate::error::BranchError::Io)?;
+        let listener =
+            UnixListener::bind(&self.socket_path).map_err(crate::error::BranchError::Io)?;
 
-        listener.set_nonblocking(true)
+        listener
+            .set_nonblocking(true)
             .map_err(crate::error::BranchError::Io)?;
 
         log::info!("Daemon listening on {:?}", self.socket_path);
@@ -227,12 +254,10 @@ impl Daemon {
                     Err(e) => Response::error(&format!("{}", e)),
                 }
             }
-            Request::Create { name, parent } => {
-                match self.create_branch(&name, &parent) {
-                    Ok(()) => Response::success(),
-                    Err(e) => Response::error(&format!("{}", e)),
-                }
-            }
+            Request::Create { name, parent } => match self.create_branch(&name, &parent) {
+                Ok(()) => Response::success(),
+                Err(e) => Response::error(&format!("{}", e)),
+            },
             Request::NotifySwitch { mountpoint, branch } => {
                 let path = PathBuf::from(&mountpoint);
                 let mut mounts = self.mounts.lock();
@@ -243,15 +268,22 @@ impl Daemon {
                     let old_branch = std::mem::replace(current_branch, branch.clone());
                     // Register notifier for new branch
                     let notifier = Arc::new(session.notifier());
-                    self.manager.register_notifier(&branch, path.clone(), notifier);
-                    log::info!("Mount {:?} switched from '{}' to '{}'", path, old_branch, branch);
+                    self.manager
+                        .register_notifier(&branch, path.clone(), notifier);
+                    log::info!(
+                        "Mount {:?} switched from '{}' to '{}'",
+                        path,
+                        old_branch,
+                        branch
+                    );
                     Response::success()
                 } else {
                     Response::error(&format!("Mount not found: {:?}", path))
                 }
             }
             Request::List => {
-                let branches: Vec<_> = self.list_branches()
+                let branches: Vec<_> = self
+                    .list_branches()
                     .into_iter()
                     .map(|(name, parent)| {
                         serde_json::json!({
@@ -270,7 +302,7 @@ impl Daemon {
     }
 }
 
-pub fn send_request(socket_path: &PathBuf, request: &Request) -> std::io::Result<Response> {
+pub fn send_request(socket_path: &Path, request: &Request) -> std::io::Result<Response> {
     let mut stream = UnixStream::connect(socket_path)?;
     let request_str = serde_json::to_string(request)?;
     writeln!(stream, "{}", request_str)?;
@@ -284,7 +316,7 @@ pub fn send_request(socket_path: &PathBuf, request: &Request) -> std::io::Result
     Ok(response)
 }
 
-pub fn is_daemon_running(socket_path: &PathBuf) -> bool {
+pub fn is_daemon_running(socket_path: &Path) -> bool {
     if !socket_path.exists() {
         return false;
     }
@@ -299,8 +331,10 @@ pub fn start_daemon_background(base_path: &Path, storage_path: &Path) -> std::io
     Command::new(&exe)
         .args([
             "daemon",
-            "--base", base_path.to_str().unwrap(),
-            "--storage", storage_path.to_str().unwrap(),
+            "--base",
+            base_path.to_str().unwrap(),
+            "--storage",
+            storage_path.to_str().unwrap(),
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -321,7 +355,7 @@ pub fn start_daemon_background(base_path: &Path, storage_path: &Path) -> std::io
     ))
 }
 
-pub fn ensure_daemon(base_path: Option<&PathBuf>, storage_path: &PathBuf) -> std::io::Result<()> {
+pub fn ensure_daemon(base_path: Option<&Path>, storage_path: &Path) -> std::io::Result<()> {
     let socket_path = storage_path.join("daemon.sock");
 
     if is_daemon_running(&socket_path) {
@@ -329,7 +363,7 @@ pub fn ensure_daemon(base_path: Option<&PathBuf>, storage_path: &PathBuf) -> std
     }
 
     let base_path = match base_path {
-        Some(p) => p.clone(),
+        Some(p) => p.to_path_buf(),
         None => {
             // Try to load from state file
             let state_file = storage_path.join("state.json");

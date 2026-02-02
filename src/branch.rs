@@ -191,7 +191,12 @@ impl BranchManager {
     }
 
     /// Register a notifier for a mounted branch
-    pub fn register_notifier(&self, branch_name: &str, mountpoint: PathBuf, notifier: Arc<Notifier>) {
+    pub fn register_notifier(
+        &self,
+        branch_name: &str,
+        mountpoint: PathBuf,
+        notifier: Arc<Notifier>,
+    ) {
         self.notifiers
             .lock()
             .insert((branch_name.to_string(), mountpoint), notifier);
@@ -223,7 +228,9 @@ impl BranchManager {
             if let Err(e) = notifier.inval_inode(ROOT_INO, 0, -1) {
                 log::debug!(
                     "Failed to invalidate root inode for branch '{}' at {:?}: {}",
-                    branch, mountpoint, e
+                    branch,
+                    mountpoint,
+                    e
                 );
             }
 
@@ -234,12 +241,16 @@ impl BranchManager {
                         if let Err(e) = notifier.inval_inode(ino, 0, -1) {
                             log::debug!(
                                 "Failed to invalidate inode {} for branch '{}': {}",
-                                ino, branch, e
+                                ino,
+                                branch,
+                                e
                             );
                         } else {
                             log::debug!(
                                 "Invalidated inode {} for branch '{}' at {:?}",
-                                ino, branch, mountpoint
+                                ino,
+                                branch,
+                                mountpoint
                             );
                         }
                     }
@@ -248,7 +259,8 @@ impl BranchManager {
 
             log::info!(
                 "Invalidated cache for branch '{}' at {:?}",
-                branch, mountpoint
+                branch,
+                mountpoint
             );
         }
     }
@@ -264,7 +276,9 @@ impl BranchManager {
                 if let Err(e) = notifier.inval_inode(ROOT_INO, 0, -1) {
                     log::debug!(
                         "Failed to invalidate root inode for branch '{}' at {:?}: {}",
-                        branch, mountpoint, e
+                        branch,
+                        mountpoint,
+                        e
                     );
                 }
 
@@ -275,7 +289,9 @@ impl BranchManager {
                             if let Err(e) = notifier.inval_inode(ino, 0, -1) {
                                 log::debug!(
                                     "Failed to invalidate inode {} for branch '{}': {}",
-                                    ino, branch, e
+                                    ino,
+                                    branch,
+                                    e
                                 );
                             }
                         }
@@ -284,7 +300,8 @@ impl BranchManager {
 
                 log::info!(
                     "Invalidated cache for branch '{}' at {:?}",
-                    branch, mountpoint
+                    branch,
+                    mountpoint
                 );
             }
         }
@@ -374,10 +391,8 @@ impl BranchManager {
         let chain = self.get_branch_chain(branch_name, &branches)?;
 
         // Collect branch names before modifying (for cache invalidation)
-        let aborted_branches: Vec<String> = chain.iter()
-            .filter(|n| *n != "main")
-            .cloned()
-            .collect();
+        let aborted_branches: Vec<String> =
+            chain.iter().filter(|n| *n != "main").cloned().collect();
 
         for name in &chain {
             if name != "main" {
