@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -84,7 +84,7 @@ impl Daemon {
         log::info!("Spawning mount for branch '{}' at {:?}", branch_name, mountpoint);
 
         let session = fuser::spawn_mount2(fs, mountpoint, &options)
-            .map_err(|e| crate::error::BranchError::Io(e.into()))?;
+            .map_err(crate::error::BranchError::Io)?;
 
         // Get the notifier for cache invalidation and register it with the manager
         let notifier = Arc::new(session.notifier());
@@ -145,10 +145,10 @@ impl Daemon {
         }
 
         let listener = UnixListener::bind(&self.socket_path)
-            .map_err(|e| crate::error::BranchError::Io(e.into()))?;
+            .map_err(crate::error::BranchError::Io)?;
 
         listener.set_nonblocking(true)
-            .map_err(|e| crate::error::BranchError::Io(e.into()))?;
+            .map_err(crate::error::BranchError::Io)?;
 
         log::info!("Daemon listening on {:?}", self.socket_path);
 
@@ -291,7 +291,7 @@ pub fn is_daemon_running(socket_path: &PathBuf) -> bool {
     UnixStream::connect(socket_path).is_ok()
 }
 
-pub fn start_daemon_background(base_path: &PathBuf, storage_path: &PathBuf) -> std::io::Result<()> {
+pub fn start_daemon_background(base_path: &Path, storage_path: &Path) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     let socket_path = storage_path.join("daemon.sock");
 
@@ -335,7 +335,7 @@ pub fn ensure_daemon(base_path: Option<&PathBuf>, storage_path: &PathBuf) -> std
             let state_file = storage_path.join("state.json");
             if state_file.exists() {
                 let state = crate::state::State::load(&state_file)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                 state.base_path
             } else {
                 return Err(std::io::Error::new(

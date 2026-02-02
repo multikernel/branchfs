@@ -12,6 +12,9 @@ use crate::error::{BranchError, Result};
 use crate::inode::ROOT_INO;
 use crate::state::{BranchInfo, BranchState, State};
 
+/// Type alias for collected changes: (deletions, file modifications)
+type CollectedChanges = (HashSet<String>, Vec<(String, PathBuf)>);
+
 pub struct Branch {
     pub name: String,
     pub parent: Option<String>,
@@ -195,10 +198,10 @@ impl BranchManager {
     }
 
     /// Unregister a notifier when unmounting
-    pub fn unregister_notifier(&self, branch_name: &str, mountpoint: &PathBuf) {
+    pub fn unregister_notifier(&self, branch_name: &str, mountpoint: &Path) {
         self.notifiers
             .lock()
-            .remove(&(branch_name.to_string(), mountpoint.clone()));
+            .remove(&(branch_name.to_string(), mountpoint.to_path_buf()));
     }
 
     /// Register an opened file inode for cache invalidation tracking
@@ -455,7 +458,7 @@ impl BranchManager {
         &self,
         chain: &[String],
         branches: &std::collections::HashMap<String, Branch>,
-    ) -> Result<(HashSet<String>, Vec<(String, PathBuf)>)> {
+    ) -> Result<CollectedChanges> {
         let mut deletions = HashSet::new();
         let mut files = Vec::new();
         let mut seen_files = HashSet::new();

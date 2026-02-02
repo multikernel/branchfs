@@ -80,7 +80,7 @@ impl BranchFs {
         Some(FileAttr {
             ino,
             size: meta.len(),
-            blocks: (meta.len() + BLOCK_SIZE as u64 - 1) / BLOCK_SIZE as u64,
+            blocks: meta.len().div_ceil(BLOCK_SIZE as u64),
             atime: meta.accessed().unwrap_or(UNIX_EPOCH),
             mtime: meta.modified().unwrap_or(UNIX_EPOCH),
             ctime: UNIX_EPOCH,
@@ -109,14 +109,14 @@ impl BranchFs {
             if let Some(src) = self.resolve(rel_path) {
                 if src.exists() && src.is_file() {
                     storage::copy_file(&src, &delta).map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
+                        std::io::Error::other(e.to_string())
                     })?;
                 }
             }
         }
 
         storage::ensure_parent_dirs(&delta)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         Ok(delta)
     }
@@ -397,6 +397,7 @@ impl Filesystem for BranchFs {
         let file = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&delta);
 
         match file {
