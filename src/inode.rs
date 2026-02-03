@@ -94,6 +94,24 @@ impl InodeManager {
         self.ino_to_info.read().keys().copied().collect()
     }
 
+    /// Remove all inodes whose path starts with `prefix`
+    pub fn clear_prefix(&self, prefix: &str) {
+        let mut path_map = self.path_to_ino.write();
+        let mut info_map = self.ino_to_info.write();
+
+        let to_remove: Vec<String> = path_map
+            .keys()
+            .filter(|p| p.starts_with(prefix))
+            .cloned()
+            .collect();
+
+        for path in to_remove {
+            if let Some(ino) = path_map.remove(&path) {
+                info_map.remove(&ino);
+            }
+        }
+    }
+
     /// Clear all inodes except root (used when switching branches)
     pub fn clear(&self) {
         let mut path_map = self.path_to_ino.write();

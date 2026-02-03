@@ -287,6 +287,16 @@ impl BranchManager {
         }
     }
 
+    /// Return the names of branches whose parent is `parent_name`.
+    pub fn get_children(&self, parent_name: &str) -> Vec<String> {
+        self.branches
+            .read()
+            .values()
+            .filter(|b| b.parent.as_deref() == Some(parent_name))
+            .map(|b| b.name.clone())
+            .collect()
+    }
+
     pub fn resolve_path(&self, branch_name: &str, rel_path: &str) -> Result<Option<PathBuf>> {
         let branches = self.branches.read();
 
