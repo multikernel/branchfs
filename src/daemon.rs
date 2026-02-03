@@ -126,7 +126,7 @@ impl Daemon {
                 // The BackgroundSession drop will handle FUSE cleanup
                 (mounts.is_empty(), Some(branch_name))
             } else {
-                return Err(crate::error::BranchError::NotFound(format!(
+                return Err(crate::error::BranchError::MountNotFound(format!(
                     "{:?}",
                     mountpoint
                 )));

@@ -5,6 +5,9 @@ pub enum BranchError {
     #[error("branch not found: {0}")]
     NotFound(String),
 
+    #[error("mountpoint not tracked: {0} (already unmounted or daemon restarted)")]
+    MountNotFound(String),
+
     #[error("branch already exists: {0}")]
     AlreadyExists(String),
 
