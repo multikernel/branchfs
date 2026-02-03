@@ -185,7 +185,10 @@ fn main() -> Result<()> {
                     },
                 );
 
-                println!("Created and switched to branch '{}' (parent: '{}')", name, parent);
+                println!(
+                    "Created and switched to branch '{}' (parent: '{}')",
+                    name, parent
+                );
             } else {
                 eprintln!("Error: {}", response.error.unwrap_or_default());
                 process::exit(1);
@@ -248,7 +251,10 @@ fn main() -> Result<()> {
             println!("Aborted branch at {:?}", mountpoint);
         }
 
-        Commands::List { mountpoint, storage } => {
+        Commands::List {
+            mountpoint,
+            storage,
+        } => {
             let storage = storage.canonicalize()?;
             let mountpoint = mountpoint.canonicalize()?;
 
@@ -299,7 +305,6 @@ fn main() -> Result<()> {
                 process::exit(1);
             }
         }
-
     }
 
     Ok(())

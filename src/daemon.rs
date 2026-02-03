@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
@@ -21,11 +21,25 @@ use crate::fs::BranchFs;
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
-    Mount { branch: String, mountpoint: String },
-    Unmount { mountpoint: String },
-    Create { name: String, parent: String, mountpoint: String },
-    NotifySwitch { mountpoint: String, branch: String },
-    List { mountpoint: String },
+    Mount {
+        branch: String,
+        mountpoint: String,
+    },
+    Unmount {
+        mountpoint: String,
+    },
+    Create {
+        name: String,
+        parent: String,
+        mountpoint: String,
+    },
+    NotifySwitch {
+        mountpoint: String,
+        branch: String,
+    },
+    List {
+        mountpoint: String,
+    },
     Shutdown,
 }
 
@@ -88,7 +102,11 @@ fn mount_hash(mountpoint: &Path) -> String {
 }
 
 impl Daemon {
-    pub fn new(base_path: PathBuf, storage_path: PathBuf, _workspace_path: PathBuf) -> Result<Self> {
+    pub fn new(
+        base_path: PathBuf,
+        storage_path: PathBuf,
+        _workspace_path: PathBuf,
+    ) -> Result<Self> {
         let socket_path = storage_path.join("daemon.sock");
 
         // Clean up orphaned mount directories on startup
@@ -119,7 +137,10 @@ impl Daemon {
 
     pub fn spawn_mount(&self, branch_name: &str, mountpoint: &Path) -> Result<()> {
         // Create mount-specific storage directory
-        let mount_storage = self.storage_path.join("mounts").join(mount_hash(mountpoint));
+        let mount_storage = self
+            .storage_path
+            .join("mounts")
+            .join(mount_hash(mountpoint));
         fs::create_dir_all(&mount_storage)?;
 
         // Create a new BranchManager for this mount
@@ -177,11 +198,16 @@ impl Daemon {
 
         // Clean up mount storage directory (full cleanup on unmount)
         if let Some(info) = mount_info {
-            info.manager.unregister_notifier(&info.current_branch, mountpoint);
+            info.manager
+                .unregister_notifier(&info.current_branch, mountpoint);
             // Delete the entire mount storage directory
             if info.mount_storage.exists() {
                 if let Err(e) = fs::remove_dir_all(&info.mount_storage) {
-                    log::warn!("Failed to clean up mount storage {:?}: {}", info.mount_storage, e);
+                    log::warn!(
+                        "Failed to clean up mount storage {:?}: {}",
+                        info.mount_storage,
+                        e
+                    );
                 } else {
                     log::info!("Cleaned up mount storage {:?}", info.mount_storage);
                 }
@@ -217,7 +243,10 @@ impl Daemon {
     }
 
     pub fn get_manager(&self, mountpoint: &Path) -> Option<Arc<BranchManager>> {
-        self.mounts.lock().get(mountpoint).map(|info| info.manager.clone())
+        self.mounts
+            .lock()
+            .get(mountpoint)
+            .map(|info| info.manager.clone())
     }
 
     pub fn run(&self) -> Result<()> {
@@ -309,7 +338,11 @@ impl Daemon {
                     Err(e) => Response::error(&format!("{}", e)),
                 }
             }
-            Request::Create { name, parent, mountpoint } => {
+            Request::Create {
+                name,
+                parent,
+                mountpoint,
+            } => {
                 let path = PathBuf::from(&mountpoint);
                 match self.create_branch(&name, &parent, &path) {
                     Ok(()) => Response::success(),
@@ -321,12 +354,14 @@ impl Daemon {
                 let mut mounts = self.mounts.lock();
                 if let Some(ref mut info) = mounts.get_mut(&path) {
                     // Unregister old notifier
-                    info.manager.unregister_notifier(&info.current_branch, &path);
+                    info.manager
+                        .unregister_notifier(&info.current_branch, &path);
                     // Update tracked branch
                     let old_branch = std::mem::replace(&mut info.current_branch, branch.clone());
                     // Register notifier for new branch
                     let notifier = Arc::new(info.session.notifier());
-                    info.manager.register_notifier(&branch, path.clone(), notifier);
+                    info.manager
+                        .register_notifier(&branch, path.clone(), notifier);
                     log::info!(
                         "Mount {:?} switched from '{}' to '{}'",
                         path,
@@ -411,11 +446,7 @@ pub fn start_daemon_background(base_path: &Path, storage_path: &Path) -> std::io
             let _ = setsid();
 
             // Run the daemon (this blocks until shutdown)
-            let daemon = match Daemon::new(
-                base_path.clone(),
-                storage_path,
-                base_path,
-            ) {
+            let daemon = match Daemon::new(base_path.clone(), storage_path, base_path) {
                 Ok(d) => d,
                 Err(e) => {
                     log::error!("Failed to create daemon: {}", e);
