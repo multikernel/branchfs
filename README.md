@@ -1,6 +1,6 @@
 # BranchFS
 
-BranchFS is a FUSE-based filesystem that provides lightweight, atomic branching capabilities on top of any existing filesystem. Designed for speculative execution workflows, it enables isolated workspaces with commit-to-root and abort semantics.
+BranchFS is a FUSE-based filesystem that enables speculative branching on top of any existing filesystem. It gives AI agents isolated workspaces with instant copy-on-write branching, atomic commit-to-root, and zero-cost abort, no root privileges required.
 
 ## Features
 
