@@ -74,12 +74,15 @@ The binary is located at `target/release/branchfs`.
 # Mount filesystem (auto-starts daemon, starts on main branch)
 branchfs mount --base ~/project /mnt/workspace
 
-# Create a speculative branch and switch to it
-branchfs create experiment -m /mnt/workspace -p main
+# Create a branch (auto-switches to it)
+branchfs create experiment /mnt/workspace
 
 # Work in the branch (files modified here are isolated)
 cd /mnt/workspace
 echo "new code" > feature.py
+
+# List branches for this mount
+branchfs list /mnt/workspace
 
 # Commit changes to base (switches back to main, stays mounted)
 branchfs commit /mnt/workspace
@@ -87,7 +90,7 @@ branchfs commit /mnt/workspace
 # Or abort to discard (switches back to main, stays mounted)
 branchfs abort /mnt/workspace
 
-# Unmount when done (daemon exits when last mount removed)
+# Unmount when done (cleans up all branches, daemon exits when last mount removed)
 branchfs unmount /mnt/workspace
 ```
 
@@ -96,8 +99,8 @@ branchfs unmount /mnt/workspace
 ```bash
 # Mount and create hierarchy
 branchfs mount --base ~/project /mnt/workspace
-branchfs create level1 -m /mnt/workspace -p main
-branchfs create level2 -m /mnt/workspace -p level1
+branchfs create level1 /mnt/workspace           # auto-switches to level1
+branchfs create level2 /mnt/workspace -p level1 # auto-switches to level2
 
 # Now on level2, work in it
 echo "deep change" > /mnt/workspace/file.txt
@@ -108,23 +111,33 @@ branchfs commit /mnt/workspace
 
 ### Parallel Speculation (Multiple Mount Points)
 
-```bash
-# Mount main workspace
-branchfs mount --base ~/project /mnt/main
+Each mount has its own isolated branch namespace:
 
-# Create sibling branches with separate mount points
-branchfs create approach-a -m /mnt/approach-a -p main
-branchfs create approach-b -m /mnt/approach-b -p main
+```bash
+# Mount two isolated workspaces from the same base
+branchfs mount --base ~/project /mnt/approach-a
+branchfs mount --base ~/project /mnt/approach-b
+
+# Create branches in each (isolated from each other)
+branchfs create experiment /mnt/approach-a
+branchfs create experiment /mnt/approach-b  # same name, different mount = OK
 
 # Work in parallel...
+echo "approach a" > /mnt/approach-a/solution.py
+echo "approach b" > /mnt/approach-b/solution.py
 
-# Commit one approach (invalidates all other branches)
+# Commit one approach
 branchfs commit /mnt/approach-a
 
-# approach-b mount now receives ESTALE on operations
+# approach-b is unaffected (isolated mount)
+cat /mnt/approach-b/solution.py  # still works
 ```
 
 ## Semantics
+
+### Per-Mount Isolation
+
+Each mount point has its own isolated branch namespace. Branches created in one mount are not visible to other mounts, even if they share the same base directory. This enables true parallel speculation without interference.
 
 ### Commit
 
@@ -132,7 +145,7 @@ Committing a branch applies the entire chain of changes to the base filesystem:
 
 1. Changes are collected from the current branch up through its ancestors
 2. Deletions are applied first, then file modifications
-3. Global epoch increments, invalidating all branches
+3. Mount's epoch increments, invalidating all branches in this mount
 4. **Mount automatically switches to main branch** (stays mounted)
 5. Memory-mapped regions trigger `SIGBUS` on next access
 
@@ -141,15 +154,15 @@ Committing a branch applies the entire chain of changes to the base filesystem:
 Aborting discards the entire branch chain without affecting the base:
 
 1. The entire branch chain (current branch up to main) is discarded
-2. Sibling branches continue operating normally (no epoch change)
+2. Sibling branches in the same mount continue operating normally
 3. **Mount automatically switches to main branch** (stays mounted)
 4. Memory-mapped regions in aborted branches trigger `SIGBUS`
 
 ### Unmount
 
-Unmounting discards the current branch and removes the mount:
+Unmounting removes the mount and cleans up all its branches:
 
-1. **Only the current branch is discarded** (single-level abort)
-2. Parent branch chain remains intact in storage
-3. The mount is removed from daemon management
-4. The daemon automatically exits when the last mount is removed
+1. **All branches for this mount are discarded** (full cleanup)
+2. Mount-specific storage is deleted
+3. The daemon automatically exits when the last mount is removed
+4. Other mounts are unaffected (per-mount isolation)
