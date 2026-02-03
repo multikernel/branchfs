@@ -6,7 +6,7 @@ source "$(dirname "$0")/test_helper.sh"
 test_commit_new_file() {
     setup
     do_mount
-    do_create "commit_new" "main" "-m"
+    do_create "commit_new" "main" "-s"
 
     # Create a new file
     echo "committed content" > "$TEST_MNT/committed_file.txt"
@@ -31,7 +31,7 @@ test_commit_new_file() {
 test_commit_modified_file() {
     setup
     do_mount
-    do_create "commit_mod" "main" "-m"
+    do_create "commit_mod" "main" "-s"
 
     # Modify existing file
     echo "modified for commit" > "$TEST_MNT/file1.txt"
@@ -49,7 +49,7 @@ test_commit_modified_file() {
 test_commit_deleted_file() {
     setup
     do_mount
-    do_create "commit_del" "main" "-m"
+    do_create "commit_del" "main" "-s"
 
     # Delete a file
     rm "$TEST_MNT/file2.txt"
@@ -67,7 +67,7 @@ test_commit_deleted_file() {
 test_commit_switches_to_main() {
     setup
     do_mount
-    do_create "commit_switch" "main" "-m"
+    do_create "commit_switch" "main" "-s"
 
     echo "branch content" > "$TEST_MNT/branch_file.txt"
 
@@ -91,10 +91,10 @@ test_commit_nested_branches() {
     do_mount
 
     # Create nested branches
-    do_create "nest1" "main" "-m"
+    do_create "nest1" "main" "-s"
     echo "nest1 content" > "$TEST_MNT/nest1_file.txt"
 
-    do_create "nest2" "nest1" "-m"
+    do_create "nest2" "nest1" "-s"
     echo "nest2 content" > "$TEST_MNT/nest2_file.txt"
 
     # Verify both files visible
@@ -121,7 +121,7 @@ test_commit_invalidates_all_branches() {
 
     # Create two sibling branches
     do_create "sibling_a" "main"
-    do_create "sibling_b" "main" "-m"
+    do_create "sibling_b" "main" "-s"
 
     echo "sibling b content" > "$TEST_MNT/sibling_b_file.txt"
 

@@ -6,7 +6,7 @@ source "$(dirname "$0")/test_helper.sh"
 test_abort_discards_changes() {
     setup
     do_mount
-    do_create "abort_test" "main" "-m"
+    do_create "abort_test" "main" "-s"
 
     # Make changes
     echo "will be discarded" > "$TEST_MNT/discard_file.txt"
@@ -32,7 +32,7 @@ test_abort_discards_changes() {
 test_abort_switches_to_main() {
     setup
     do_mount
-    do_create "abort_switch" "main" "-m"
+    do_create "abort_switch" "main" "-s"
 
     # Abort
     do_abort
@@ -54,10 +54,10 @@ test_abort_nested_discards_chain() {
     do_mount
 
     # Create nested branches
-    do_create "abort_n1" "main" "-m"
+    do_create "abort_n1" "main" "-s"
     echo "n1 content" > "$TEST_MNT/n1_file.txt"
 
-    do_create "abort_n2" "abort_n1" "-m"
+    do_create "abort_n2" "abort_n1" "-s"
     echo "n2 content" > "$TEST_MNT/n2_file.txt"
 
     # Abort from n2 should discard both n2 and n1
@@ -84,7 +84,7 @@ test_abort_preserves_siblings() {
 
     # Create two sibling branches
     do_create "keep_sibling" "main"
-    do_create "abort_sibling" "main" "-m"
+    do_create "abort_sibling" "main" "-s"
 
     echo "will abort" > "$TEST_MNT/abort_file.txt"
 

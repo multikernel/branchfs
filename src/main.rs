@@ -5,7 +5,7 @@ use std::process;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
-use branchfs::daemon::{self, Daemon, Request, Response};
+use branchfs::daemon::{self, Request, Response};
 
 #[derive(Parser)]
 #[command(name = "branchfs")]
@@ -36,6 +36,9 @@ enum Commands {
         /// Branch name
         name: String,
 
+        /// Mount point where the branch should be created
+        mountpoint: PathBuf,
+
         /// Parent branch name
         #[arg(long, short, default_value = "main")]
         parent: String,
@@ -44,9 +47,9 @@ enum Commands {
         #[arg(long, default_value = "/var/lib/branchfs")]
         storage: PathBuf,
 
-        /// Mount point (if provided, mounts the branch immediately after creation)
-        #[arg(long, short)]
-        mount: Option<PathBuf>,
+        /// Switch to the new branch after creation
+        #[arg(long, short = 's')]
+        switch: bool,
     },
 
     /// Commit branch to base
@@ -69,8 +72,11 @@ enum Commands {
         storage: PathBuf,
     },
 
-    /// List branches
+    /// List branches for a mountpoint
     List {
+        /// Mount point to list branches for
+        mountpoint: PathBuf,
+
         /// Storage directory
         #[arg(long, default_value = "/var/lib/branchfs")]
         storage: PathBuf,
@@ -83,16 +89,6 @@ enum Commands {
 
         /// Storage directory
         #[arg(long, default_value = "/var/lib/branchfs")]
-        storage: PathBuf,
-    },
-
-    /// Internal: run daemon (not for direct use)
-    #[command(hide = true)]
-    Daemon {
-        #[arg(long)]
-        base: PathBuf,
-
-        #[arg(long)]
         storage: PathBuf,
     },
 }
@@ -150,29 +146,28 @@ fn main() -> Result<()> {
 
         Commands::Create {
             name,
+            mountpoint,
             parent,
             storage,
-            mount,
+            switch,
         } => {
             let storage = storage.canonicalize()?;
-
-            // Ensure daemon is running
-            daemon::ensure_daemon(None, &storage).map_err(|e| anyhow::anyhow!("{}", e))?;
+            let mountpoint = mountpoint.canonicalize()?;
 
             let response = send_request(
                 &storage,
                 &Request::Create {
                     name: name.clone(),
                     parent: parent.clone(),
+                    mountpoint: mountpoint.to_string_lossy().to_string(),
                 },
             )?;
 
             if response.ok {
                 println!("Created branch '{}' with parent '{}'", name, parent);
 
-                // Switch the mount to the new branch if --mount is provided
-                if let Some(mountpoint) = mount {
-                    let mountpoint = mountpoint.canonicalize()?;
+                // Switch the mount to the new branch if --switch is provided
+                if switch {
                     let ctl_path = mountpoint.join(".branchfs_ctl");
 
                     // Write switch command to control file
@@ -263,13 +258,16 @@ fn main() -> Result<()> {
             println!("Aborted branch at {:?}", mountpoint);
         }
 
-        Commands::List { storage } => {
+        Commands::List { mountpoint, storage } => {
             let storage = storage.canonicalize()?;
+            let mountpoint = mountpoint.canonicalize()?;
 
-            // Ensure daemon is running
-            daemon::ensure_daemon(None, &storage).map_err(|e| anyhow::anyhow!("{}", e))?;
-
-            let response = send_request(&storage, &Request::List)?;
+            let response = send_request(
+                &storage,
+                &Request::List {
+                    mountpoint: mountpoint.to_string_lossy().to_string(),
+                },
+            )?;
 
             if response.ok {
                 println!("{:<20} {:<20}", "BRANCH", "PARENT");
@@ -312,11 +310,6 @@ fn main() -> Result<()> {
             }
         }
 
-        Commands::Daemon { base, storage } => {
-            // Internal daemon command - runs in foreground
-            let daemon = Daemon::new(base.clone(), storage.clone(), base)?;
-            daemon.run()?;
-        }
     }
 
     Ok(())

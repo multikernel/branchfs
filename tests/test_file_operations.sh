@@ -18,7 +18,7 @@ test_read_base_files() {
 test_write_new_file_in_branch() {
     setup
     do_mount
-    do_create "write_test" "main" "-m"
+    do_create "write_test" "main" "-s"
 
     # Create a new file
     echo "new file content" > "$TEST_MNT/new_file.txt"
@@ -34,7 +34,7 @@ test_write_new_file_in_branch() {
 test_modify_existing_file_cow() {
     setup
     do_mount
-    do_create "cow_test" "main" "-m"
+    do_create "cow_test" "main" "-s"
 
     # Modify an existing file (triggers copy-on-write)
     echo "modified content" > "$TEST_MNT/file1.txt"
@@ -49,7 +49,7 @@ test_modify_existing_file_cow() {
 test_delete_file_in_branch() {
     setup
     do_mount
-    do_create "delete_test" "main" "-m"
+    do_create "delete_test" "main" "-s"
 
     # File exists initially
     assert_file_exists "$TEST_MNT/file1.txt" "File exists before delete"
@@ -67,7 +67,7 @@ test_delete_file_in_branch() {
 test_create_directory_in_branch() {
     setup
     do_mount
-    do_create "mkdir_test" "main" "-m"
+    do_create "mkdir_test" "main" "-s"
 
     # Create a new directory
     mkdir "$TEST_MNT/newdir"
@@ -86,7 +86,7 @@ test_create_directory_in_branch() {
 test_delete_directory_in_branch() {
     setup
     do_mount
-    do_create "rmdir_test" "main" "-m"
+    do_create "rmdir_test" "main" "-s"
 
     # Directory exists initially
     assert "[[ -d '$TEST_MNT/subdir' ]]" "Subdir exists before delete"
@@ -104,7 +104,7 @@ test_delete_directory_in_branch() {
 test_append_to_file() {
     setup
     do_mount
-    do_create "append_test" "main" "-m"
+    do_create "append_test" "main" "-s"
 
     # Append to existing file
     echo "appended line" >> "$TEST_MNT/file1.txt"

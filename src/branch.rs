@@ -10,7 +10,6 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::error::{BranchError, Result};
 use crate::inode::ROOT_INO;
-use crate::state::{BranchInfo, BranchState, State};
 
 /// Type alias for collected changes: (deletions, file modifications)
 type CollectedChanges = (HashSet<String>, Vec<(String, PathBuf)>);
@@ -43,10 +42,6 @@ impl Branch {
             tombstones_file,
             tombstones: RwLock::new(tombstones),
         })
-    }
-
-    pub fn load(name: &str, info: &BranchInfo, storage_path: &Path) -> Result<Self> {
-        Self::new(name, info.parent.as_deref(), storage_path)
     }
 
     fn load_tombstones(path: &Path) -> Result<HashSet<String>> {
@@ -97,7 +92,6 @@ pub struct BranchManager {
     pub base_path: PathBuf,
     pub workspace_path: PathBuf,
     branches: RwLock<std::collections::HashMap<String, Branch>>,
-    state_file: PathBuf,
     pub epoch: AtomicU64,
     /// Notifiers for invalidating kernel cache on commit/abort
     /// Maps (branch_name, mountpoint) -> Notifier
@@ -110,31 +104,18 @@ pub struct BranchManager {
 impl BranchManager {
     pub fn new(storage_path: PathBuf, base_path: PathBuf, workspace_path: PathBuf) -> Result<Self> {
         fs::create_dir_all(&storage_path)?;
-        let state_file = storage_path.join("state.json");
 
-        let state = if state_file.exists() {
-            State::load(&state_file)?
-        } else {
-            let state = State::new(base_path.clone(), workspace_path.clone());
-            state.save(&state_file)?;
-            state
-        };
-
+        // Always start fresh with just the "main" branch
         let mut branches = std::collections::HashMap::new();
-        for (name, info) in &state.branches {
-            if info.state == BranchState::Active {
-                let branch = Branch::load(name, info, &storage_path)?;
-                branches.insert(name.clone(), branch);
-            }
-        }
+        let main_branch = Branch::new("main", None, &storage_path)?;
+        branches.insert("main".to_string(), main_branch);
 
         Ok(Self {
             storage_path,
             base_path,
             workspace_path,
             branches: RwLock::new(branches),
-            state_file: state_file.clone(),
-            epoch: AtomicU64::new(state.epoch),
+            epoch: AtomicU64::new(0),
             notifiers: Mutex::new(std::collections::HashMap::new()),
             opened_inodes: Mutex::new(std::collections::HashMap::new()),
         })
@@ -154,7 +135,6 @@ impl BranchManager {
         let branch = Branch::new(name, Some(parent), &self.storage_path)?;
         branches.insert(name.to_string(), branch);
 
-        self.save_state(&branches)?;
         Ok(())
     }
 
@@ -372,7 +352,6 @@ impl BranchManager {
         branches.insert("main".to_string(), main_branch);
 
         self.epoch.fetch_add(1, Ordering::SeqCst);
-        self.save_state(&branches)?;
 
         // Invalidate kernel cache for all mounts (epoch changed, everything is stale)
         // Must be done after releasing the branches lock to avoid deadlock
@@ -405,9 +384,7 @@ impl BranchManager {
         }
 
         // Note: abort does NOT increment epoch - only the aborted branch chain
-        // becomes invalid, siblings remain valid. The aborted branches are removed
-        // from state.json, so is_branch_valid() will return false for them.
-        self.save_state(&branches)?;
+        // becomes invalid, siblings remain valid.
 
         // Invalidate kernel cache for aborted branches only
         // Must be done after releasing the branches lock
@@ -436,8 +413,6 @@ impl BranchManager {
         if branch_dir.exists() {
             fs::remove_dir_all(&branch_dir)?;
         }
-
-        self.save_state(&branches)?;
 
         // Invalidate kernel cache for this branch only
         drop(branches);
@@ -523,25 +498,6 @@ impl BranchManager {
             }
         }
 
-        Ok(())
-    }
-
-    fn save_state(&self, branches: &std::collections::HashMap<String, Branch>) -> Result<()> {
-        let mut state = State::new(self.base_path.clone(), self.workspace_path.clone());
-        state.branches.clear();
-        state.epoch = self.epoch.load(Ordering::SeqCst);
-
-        for (name, branch) in branches {
-            state.branches.insert(
-                name.clone(),
-                BranchInfo {
-                    parent: branch.parent.clone(),
-                    state: BranchState::Active,
-                },
-            );
-        }
-
-        state.save(&self.state_file)?;
         Ok(())
     }
 }
