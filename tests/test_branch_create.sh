@@ -17,7 +17,7 @@ test_create_branch_without_mount() {
     do_unmount
 }
 
-test_create_branch_with_mount() {
+test_create_branch_with_switch() {
     setup
     do_mount
 
@@ -25,7 +25,7 @@ test_create_branch_with_mount() {
     assert_file_contains "$TEST_MNT/file1.txt" "base content" "Before branch: base content visible"
 
     # Create a branch and switch to it
-    do_create "feature2" "main" "-m"
+    do_create "feature2" "main"
 
     # Should still see base files
     assert_file_exists "$TEST_MNT/file1.txt" "After branch: file1.txt still visible"
@@ -46,11 +46,11 @@ test_create_nested_branches() {
     do_mount
 
     # Create level1 branch
-    do_create "level1" "main" "-m"
+    do_create "level1" "main"
     echo "level1 content" > "$TEST_MNT/level1_file.txt"
 
     # Create level2 branch from level1
-    do_create "level2" "level1" "-m"
+    do_create "level2" "level1"
     echo "level2 content" > "$TEST_MNT/level2_file.txt"
 
     # Should see files from all levels
@@ -83,7 +83,7 @@ test_create_sibling_branches() {
 
 # Run tests
 run_test "Create Branch Without Mount" test_create_branch_without_mount
-run_test "Create Branch With Mount (-m)" test_create_branch_with_mount
+run_test "Create Branch and Auto-Switch" test_create_branch_with_switch
 run_test "Create Nested Branches" test_create_nested_branches
 run_test "Create Sibling Branches" test_create_sibling_branches
 

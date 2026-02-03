@@ -3,7 +3,6 @@ pub mod daemon;
 pub mod error;
 pub mod fs;
 pub mod inode;
-pub mod state;
 pub mod storage;
 
 pub use daemon::{

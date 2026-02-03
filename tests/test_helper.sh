@@ -99,17 +99,15 @@ do_unmount() {
     sleep 0.3
 }
 
-# Create a branch
+# Create a branch (always switches to it)
+# Usage: do_create <name> [parent]
+# - name: branch name
+# - parent: parent branch (default: main)
 do_create() {
     local name="$1"
     local parent="${2:-main}"
-    local mount_flag="${3:-}"
 
-    if [[ -n "$mount_flag" ]]; then
-        "$BRANCHFS" create "$name" -p "$parent" -m "$TEST_MNT" --storage "$TEST_STORAGE"
-    else
-        "$BRANCHFS" create "$name" -p "$parent" --storage "$TEST_STORAGE"
-    fi
+    "$BRANCHFS" create "$name" "$TEST_MNT" -p "$parent" --storage "$TEST_STORAGE"
     sleep 0.3
 }
 
@@ -125,7 +123,7 @@ do_abort() {
 
 # List branches
 do_list() {
-    "$BRANCHFS" list --storage "$TEST_STORAGE"
+    "$BRANCHFS" list "$TEST_MNT" --storage "$TEST_STORAGE"
 }
 
 # Assert that a condition is true
