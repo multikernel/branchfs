@@ -283,12 +283,35 @@ impl BranchFs {
         Some(self.classify_path(&path))
     }
 
+    /// Write data to a delta file at the given offset.
+    fn write_to_delta(
+        delta: &std::path::Path,
+        offset: i64,
+        data: &[u8],
+    ) -> std::result::Result<u32, i32> {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(delta)
+            .map_err(|_| libc::EIO)?;
+        f.seek(SeekFrom::Start(offset as u64))
+            .map_err(|_| libc::EIO)?;
+        f.write(data).map(|n| n as u32).map_err(|_| libc::EIO)
+    }
+
     /// Collect readdir entries for a directory resolved via a specific branch.
-    fn collect_branch_readdir_entries(
+    ///
+    /// `inode_prefix` controls how child inode paths are formed:
+    /// - `"/@branch"` for branch subtrees (produces `/@branch/child`)
+    /// - `""` for root-level paths (produces `/child`)
+    fn collect_readdir_entries(
         &self,
         branch: &str,
         rel_path: &str,
         ino: u64,
+        inode_prefix: &str,
     ) -> Vec<(u64, FileType, String)> {
         let mut entries = vec![
             (ino, FileType::Directory, ".".to_string()),
@@ -311,8 +334,7 @@ impl BranchFs {
                     } else {
                         format!("{}/{}", rel_path, name)
                     };
-                    // Inode path in the global namespace: /@branch/child_rel
-                    let inode_path = format!("/@{}{}", branch, child_rel);
+                    let inode_path = format!("{}{}", inode_prefix, child_rel);
                     let is_dir = entry.path().is_dir();
                     let child_ino = self.inodes.get_or_create(&inode_path, is_dir);
                     let kind = if is_dir {
@@ -337,7 +359,7 @@ impl BranchFs {
                             } else {
                                 format!("{}/{}", rel_path, name)
                             };
-                            let inode_path = format!("/@{}{}", branch, child_rel);
+                            let inode_path = format!("{}{}", inode_prefix, child_rel);
                             let is_dir = entry.path().is_dir();
                             let child_ino = self.inodes.get_or_create(&inode_path, is_dir);
                             let kind = if is_dir {
@@ -413,95 +435,81 @@ impl Filesystem for BranchFs {
         }
 
         // === Parent is inside an @branch subtree ===
-        match self.classify_path(&parent_path) {
-            PathContext::BranchDir(ref branch) | PathContext::BranchPath(ref branch, _) => {
-                let branch = branch.clone();
+        let branch_ctx = match self.classify_path(&parent_path) {
+            PathContext::BranchDir(b) => Some((b, "/".to_string())),
+            PathContext::BranchPath(b, rel) => Some((b, rel)),
+            _ => None,
+        };
 
-                // Determine the relative path within the branch for the parent
-                let parent_rel = match self.classify_path(&parent_path) {
-                    PathContext::BranchDir(_) => "/".to_string(),
-                    PathContext::BranchPath(_, rel) => rel,
-                    _ => unreachable!(),
-                };
+        if let Some((branch, parent_rel)) = branch_ctx {
+            // Looking up .branchfs_ctl inside a branch dir (only at branch root)
+            if parent_rel == "/" && name_str == CTL_FILE {
+                let ctl_ino = self.get_or_create_branch_ctl_ino(&branch);
+                reply.entry(&TTL, &self.ctl_file_attr(ctl_ino), 0);
+                return;
+            }
 
-                // Looking up .branchfs_ctl inside a branch dir (only at branch root)
-                if parent_rel == "/" && name_str == CTL_FILE {
-                    let ctl_ino = self.get_or_create_branch_ctl_ino(&branch);
-                    reply.entry(&TTL, &self.ctl_file_attr(ctl_ino), 0);
-                    return;
+            // Looking up @child inside a branch dir (nested branch)
+            if name_str.starts_with('@') {
+                let child_branch = &name_str[1..];
+                let children = self.manager.get_children(&branch);
+                if parent_rel == "/" && children.iter().any(|c| c == child_branch) {
+                    let inode_path = format!("/@{}/@{}", branch, child_branch);
+                    let ino = self.inodes.get_or_create(&inode_path, true);
+                    reply.entry(&TTL, &self.synthetic_dir_attr(ino), 0);
+                } else {
+                    reply.error(libc::ENOENT);
                 }
+                return;
+            }
 
-                // Looking up @child inside a branch dir (nested branch)
-                if name_str.starts_with('@') {
-                    let child_branch = &name_str[1..];
-                    // Check if child_branch is a child of this branch
-                    let children = self.manager.get_children(&branch);
-                    if children.iter().any(|c| c == child_branch) {
-                        let inode_path = if parent_rel == "/" {
-                            format!("/@{}/@{}", branch, child_branch)
-                        } else {
-                            // Nested @child only at branch root
-                            reply.error(libc::ENOENT);
-                            return;
-                        };
-                        let ino = self.inodes.get_or_create(&inode_path, true);
-                        reply.entry(&TTL, &self.synthetic_dir_attr(ino), 0);
-                        return;
-                    } else {
-                        reply.error(libc::ENOENT);
-                        return;
-                    }
-                }
+            // Regular file/dir inside branch
+            if !self.manager.is_branch_valid(&branch) {
+                reply.error(libc::ENOENT);
+                return;
+            }
 
-                // Regular file/dir inside branch
-                if !self.manager.is_branch_valid(&branch) {
+            let child_rel = if parent_rel == "/" {
+                format!("/{}", name_str)
+            } else {
+                format!("{}/{}", parent_rel, name_str)
+            };
+
+            let resolved = match self.resolve_for_branch(&branch, &child_rel) {
+                Some(p) => p,
+                None => {
                     reply.error(libc::ENOENT);
                     return;
                 }
+            };
 
-                let child_rel = if parent_rel == "/" {
-                    format!("/{}", name_str)
-                } else {
-                    format!("{}/{}", parent_rel, name_str)
-                };
-
-                let resolved = match self.resolve_for_branch(&branch, &child_rel) {
-                    Some(p) => p,
-                    None => {
-                        reply.error(libc::ENOENT);
-                        return;
-                    }
-                };
-
-                let inode_path = format!("/@{}{}", branch, child_rel);
-                let is_dir = resolved.is_dir();
-                let ino = self.inodes.get_or_create(&inode_path, is_dir);
-                match self.make_attr(ino, &resolved) {
-                    Some(attr) => reply.entry(&TTL, &attr, 0),
-                    None => reply.error(libc::ENOENT),
-                }
+            let inode_path = format!("/@{}{}", branch, child_rel);
+            let is_dir = resolved.is_dir();
+            let ino = self.inodes.get_or_create(&inode_path, is_dir);
+            match self.make_attr(ino, &resolved) {
+                Some(attr) => reply.entry(&TTL, &attr, 0),
+                None => reply.error(libc::ENOENT),
             }
-            _ => {
-                // Parent is a regular root-path subdir
-                if self.is_stale() {
-                    reply.error(libc::ESTALE);
+        } else {
+            // Parent is a regular root-path subdir
+            if self.is_stale() {
+                reply.error(libc::ESTALE);
+                return;
+            }
+
+            let path = format!("{}/{}", parent_path, name_str);
+            let resolved = match self.resolve(&path) {
+                Some(p) => p,
+                None => {
+                    reply.error(libc::ENOENT);
                     return;
                 }
-
-                let path = format!("{}/{}", parent_path, name_str);
-                let resolved = match self.resolve(&path) {
-                    Some(p) => p,
-                    None => {
-                        reply.error(libc::ENOENT);
-                        return;
-                    }
-                };
-                let is_dir = resolved.is_dir();
-                let ino = self.inodes.get_or_create(&path, is_dir);
-                match self.make_attr(ino, &resolved) {
-                    Some(attr) => reply.entry(&TTL, &attr, 0),
-                    None => reply.error(libc::ENOENT),
-                }
+            };
+            let is_dir = resolved.is_dir();
+            let ino = self.inodes.get_or_create(&path, is_dir);
+            match self.make_attr(ino, &resolved) {
+                Some(attr) => reply.entry(&TTL, &attr, 0),
+                None => reply.error(libc::ENOENT),
             }
         }
     }
@@ -810,26 +818,9 @@ impl Filesystem for BranchFs {
                         return;
                     }
                 };
-
-                use std::io::{Seek, SeekFrom, Write};
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&delta);
-
-                match file {
-                    Ok(mut f) => {
-                        if f.seek(SeekFrom::Start(offset as u64)).is_err() {
-                            reply.error(libc::EIO);
-                            return;
-                        }
-                        match f.write(data) {
-                            Ok(n) => reply.written(n as u32),
-                            Err(_) => reply.error(libc::EIO),
-                        }
-                    }
-                    Err(_) => reply.error(libc::EIO),
+                match Self::write_to_delta(&delta, offset, data) {
+                    Ok(n) => reply.written(n),
+                    Err(e) => reply.error(e),
                 }
             }
             _ => {
@@ -841,32 +832,15 @@ impl Filesystem for BranchFs {
                         return;
                     }
                 };
-
-                use std::io::{Seek, SeekFrom, Write};
-                let file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(&delta);
-
-                match file {
-                    Ok(mut f) => {
-                        if f.seek(SeekFrom::Start(offset as u64)).is_err() {
-                            reply.error(libc::EIO);
+                match Self::write_to_delta(&delta, offset, data) {
+                    Ok(n) => {
+                        if self.is_stale() {
+                            reply.error(libc::ESTALE);
                             return;
                         }
-                        match f.write(data) {
-                            Ok(n) => {
-                                if self.is_stale() {
-                                    reply.error(libc::ESTALE);
-                                    return;
-                                }
-                                reply.written(n as u32)
-                            }
-                            Err(_) => reply.error(libc::EIO),
-                        }
+                        reply.written(n)
                     }
-                    Err(_) => reply.error(libc::EIO),
+                    Err(e) => reply.error(e),
                 }
             }
         }
@@ -901,7 +875,9 @@ impl Filesystem for BranchFs {
                     return;
                 }
 
-                let mut entries = self.collect_branch_readdir_entries(&branch, "/", ino);
+                let inode_prefix = format!("/@{}", branch);
+                let mut entries =
+                    self.collect_readdir_entries(&branch, "/", ino, &inode_prefix);
 
                 // Add .branchfs_ctl
                 let ctl_ino = self.get_or_create_branch_ctl_ino(&branch);
@@ -931,7 +907,9 @@ impl Filesystem for BranchFs {
                     return;
                 }
 
-                let entries = self.collect_branch_readdir_entries(&branch, &rel_path, ino);
+                let inode_prefix = format!("/@{}", branch);
+                let entries =
+                    self.collect_readdir_entries(&branch, &rel_path, ino, &inode_prefix);
 
                 for (i, (e_ino, kind, name)) in
                     entries.into_iter().enumerate().skip(offset as usize)
@@ -949,54 +927,9 @@ impl Filesystem for BranchFs {
                     return;
                 }
 
-                let mut entries = vec![
-                    (ino, FileType::Directory, ".".to_string()),
-                    (ino, FileType::Directory, "..".to_string()),
-                ];
-
-                let mut seen = std::collections::HashSet::new();
-
-                // Collect from base directory
-                let base_dir = self.manager.base_path.clone();
-                if let Ok(dir) = std::fs::read_dir(&base_dir) {
-                    for entry in dir.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if seen.insert(name.clone()) {
-                            let child_path = format!("/{}", name);
-                            let is_dir = entry.path().is_dir();
-                            let child_ino = self.inodes.get_or_create(&child_path, is_dir);
-                            let kind = if is_dir {
-                                FileType::Directory
-                            } else {
-                                FileType::RegularFile
-                            };
-                            entries.push((child_ino, kind, name));
-                        }
-                    }
-                }
-
-                // Collect from branch deltas (current branch)
-                if let Some(resolved) = self.resolve("/") {
-                    if resolved != base_dir {
-                        if let Ok(dir) = std::fs::read_dir(&resolved) {
-                            for entry in dir.flatten() {
-                                let name = entry.file_name().to_string_lossy().to_string();
-                                if seen.insert(name.clone()) {
-                                    let child_path = format!("/{}", name);
-                                    let is_dir = entry.path().is_dir();
-                                    let child_ino =
-                                        self.inodes.get_or_create(&child_path, is_dir);
-                                    let kind = if is_dir {
-                                        FileType::Directory
-                                    } else {
-                                        FileType::RegularFile
-                                    };
-                                    entries.push((child_ino, kind, name));
-                                }
-                            }
-                        }
-                    }
-                }
+                let branch_name = self.get_branch_name();
+                let mut entries =
+                    self.collect_readdir_entries(&branch_name, "/", ino, "");
 
                 // Add .branchfs_ctl
                 entries.push((CTL_INO, FileType::RegularFile, CTL_FILE.to_string()));
@@ -1028,62 +961,16 @@ impl Filesystem for BranchFs {
 
                 reply.ok();
             }
-            PathContext::RootPath(_) => {
+            PathContext::RootPath(ref rp2) => {
                 // Non-root subdir via current branch (existing logic)
                 if self.is_stale() {
                     reply.error(libc::ESTALE);
                     return;
                 }
 
-                let mut entries = vec![
-                    (ino, FileType::Directory, ".".to_string()),
-                    (ino, FileType::Directory, "..".to_string()),
-                ];
-
-                let mut seen = std::collections::HashSet::new();
-
-                let base_dir = self
-                    .manager
-                    .base_path
-                    .join(path.trim_start_matches('/'));
-                if let Ok(dir) = std::fs::read_dir(&base_dir) {
-                    for entry in dir.flatten() {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if seen.insert(name.clone()) {
-                            let child_path = format!("{}/{}", path, name);
-                            let is_dir = entry.path().is_dir();
-                            let child_ino = self.inodes.get_or_create(&child_path, is_dir);
-                            let kind = if is_dir {
-                                FileType::Directory
-                            } else {
-                                FileType::RegularFile
-                            };
-                            entries.push((child_ino, kind, name));
-                        }
-                    }
-                }
-
-                if let Some(resolved) = self.resolve(&path) {
-                    if resolved != base_dir {
-                        if let Ok(dir) = std::fs::read_dir(&resolved) {
-                            for entry in dir.flatten() {
-                                let name = entry.file_name().to_string_lossy().to_string();
-                                if seen.insert(name.clone()) {
-                                    let child_path = format!("{}/{}", path, name);
-                                    let is_dir = entry.path().is_dir();
-                                    let child_ino =
-                                        self.inodes.get_or_create(&child_path, is_dir);
-                                    let kind = if is_dir {
-                                        FileType::Directory
-                                    } else {
-                                        FileType::RegularFile
-                                    };
-                                    entries.push((child_ino, kind, name));
-                                }
-                            }
-                        }
-                    }
-                }
+                let branch_name = self.get_branch_name();
+                let entries =
+                    self.collect_readdir_entries(&branch_name, rp2, ino, "");
 
                 if self.is_stale() {
                     reply.error(libc::ESTALE);
@@ -1126,89 +1013,78 @@ impl Filesystem for BranchFs {
 
         let name_str = name.to_string_lossy();
 
-        match self.classify_path(&parent_path) {
-            PathContext::BranchDir(branch) => {
-                // Creating a file inside a branch root dir
-                if !self.manager.is_branch_valid(&branch) {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
-                let rel_path = format!("/{}", name_str);
-                let delta = self.get_delta_path_for_branch(&branch, &rel_path);
-                if storage::ensure_parent_dirs(&delta).is_err() {
-                    reply.error(libc::EIO);
-                    return;
-                }
-                match std::fs::File::create(&delta) {
-                    Ok(_) => {
-                        let inode_path = format!("/@{}{}", branch, rel_path);
-                        let ino = self.inodes.get_or_create(&inode_path, false);
-                        if let Some(attr) = self.make_attr(ino, &delta) {
-                            reply.created(&TTL, &attr, 0, 0, 0);
-                        } else {
-                            reply.error(libc::EIO);
-                        }
-                    }
-                    Err(_) => reply.error(libc::EIO),
-                }
-            }
-            PathContext::BranchPath(branch, parent_rel) => {
-                // Creating a file inside a branch subdir
-                if !self.manager.is_branch_valid(&branch) {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
-                let rel_path = format!("{}/{}", parent_rel, name_str);
-                let delta = self.get_delta_path_for_branch(&branch, &rel_path);
-                if storage::ensure_parent_dirs(&delta).is_err() {
-                    reply.error(libc::EIO);
-                    return;
-                }
-                match std::fs::File::create(&delta) {
-                    Ok(_) => {
-                        let inode_path = format!("/@{}{}", branch, rel_path);
-                        let ino = self.inodes.get_or_create(&inode_path, false);
-                        if let Some(attr) = self.make_attr(ino, &delta) {
-                            reply.created(&TTL, &attr, 0, 0, 0);
-                        } else {
-                            reply.error(libc::EIO);
-                        }
-                    }
-                    Err(_) => reply.error(libc::EIO),
-                }
-            }
-            PathContext::BranchCtl(_) | PathContext::RootCtl => {
-                reply.error(libc::EPERM);
-            }
-            PathContext::RootPath(rp) => {
-                // Existing root-path logic
-                let path = if rp == "/" {
-                    format!("/{}", name_str)
-                } else {
-                    format!("{}/{}", rp, name_str)
-                };
+        let branch_ctx = match self.classify_path(&parent_path) {
+            PathContext::BranchDir(b) => Some((b, "/".to_string())),
+            PathContext::BranchPath(b, rel) => Some((b, rel)),
+            _ => None,
+        };
 
-                let delta = self.get_delta_path(&path);
-                if storage::ensure_parent_dirs(&delta).is_err() {
-                    reply.error(libc::EIO);
-                    return;
-                }
-
-                match std::fs::File::create(&delta) {
-                    Ok(_) => {
-                        if self.is_stale() {
-                            let _ = std::fs::remove_file(&delta);
-                            reply.error(libc::ESTALE);
-                            return;
-                        }
-                        let ino = self.inodes.get_or_create(&path, false);
-                        if let Some(attr) = self.make_attr(ino, &delta) {
-                            reply.created(&TTL, &attr, 0, 0, 0);
-                        } else {
-                            reply.error(libc::EIO);
-                        }
+        if let Some((branch, parent_rel)) = branch_ctx {
+            // Creating a file inside a branch dir
+            if !self.manager.is_branch_valid(&branch) {
+                reply.error(libc::ENOENT);
+                return;
+            }
+            let rel_path = if parent_rel == "/" {
+                format!("/{}", name_str)
+            } else {
+                format!("{}/{}", parent_rel, name_str)
+            };
+            let delta = self.get_delta_path_for_branch(&branch, &rel_path);
+            if storage::ensure_parent_dirs(&delta).is_err() {
+                reply.error(libc::EIO);
+                return;
+            }
+            match std::fs::File::create(&delta) {
+                Ok(_) => {
+                    let inode_path = format!("/@{}{}", branch, rel_path);
+                    let ino = self.inodes.get_or_create(&inode_path, false);
+                    if let Some(attr) = self.make_attr(ino, &delta) {
+                        reply.created(&TTL, &attr, 0, 0, 0);
+                    } else {
+                        reply.error(libc::EIO);
                     }
-                    Err(_) => reply.error(libc::EIO),
+                }
+                Err(_) => reply.error(libc::EIO),
+            }
+        } else {
+            match self.classify_path(&parent_path) {
+                PathContext::BranchCtl(_) | PathContext::RootCtl => {
+                    reply.error(libc::EPERM);
+                }
+                PathContext::RootPath(rp) => {
+                    // Existing root-path logic
+                    let path = if rp == "/" {
+                        format!("/{}", name_str)
+                    } else {
+                        format!("{}/{}", rp, name_str)
+                    };
+
+                    let delta = self.get_delta_path(&path);
+                    if storage::ensure_parent_dirs(&delta).is_err() {
+                        reply.error(libc::EIO);
+                        return;
+                    }
+
+                    match std::fs::File::create(&delta) {
+                        Ok(_) => {
+                            if self.is_stale() {
+                                let _ = std::fs::remove_file(&delta);
+                                reply.error(libc::ESTALE);
+                                return;
+                            }
+                            let ino = self.inodes.get_or_create(&path, false);
+                            if let Some(attr) = self.make_attr(ino, &delta) {
+                                reply.created(&TTL, &attr, 0, 0, 0);
+                            } else {
+                                reply.error(libc::EIO);
+                            }
+                        }
+                        Err(_) => reply.error(libc::EIO),
+                    }
+                }
+                _ => {
+                    reply.error(libc::ENOENT);
                 }
             }
         }
@@ -1225,77 +1101,80 @@ impl Filesystem for BranchFs {
 
         let name_str = name.to_string_lossy();
 
-        match self.classify_path(&parent_path) {
-            PathContext::BranchDir(branch) | PathContext::BranchPath(branch, _) => {
-                let parent_rel = match self.classify_path(&parent_path) {
-                    PathContext::BranchDir(_) => "/".to_string(),
-                    PathContext::BranchPath(_, rel) => rel,
-                    _ => unreachable!(),
-                };
+        let branch_ctx = match self.classify_path(&parent_path) {
+            PathContext::BranchDir(b) => Some((b, "/".to_string())),
+            PathContext::BranchPath(b, rel) => Some((b, rel)),
+            _ => None,
+        };
 
-                // Can't unlink @child dirs or .branchfs_ctl
-                if name_str.starts_with('@') || *name_str == *CTL_FILE {
-                    reply.error(libc::EPERM);
-                    return;
-                }
-
-                if !self.manager.is_branch_valid(&branch) {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
-
-                let rel_path = if parent_rel == "/" {
-                    format!("/{}", name_str)
-                } else {
-                    format!("{}/{}", parent_rel, name_str)
-                };
-
-                let branch_clone = branch.clone();
-                let result = self.manager.with_branch(&branch_clone, |b| {
-                    b.add_tombstone(&rel_path)?;
-                    let delta = b.delta_path(&rel_path);
-                    if delta.exists() {
-                        std::fs::remove_file(&delta)?;
-                    }
-                    Ok(())
-                });
-
-                if result.is_err() {
-                    reply.error(libc::EIO);
-                    return;
-                }
-
-                let inode_path = format!("/@{}{}", branch, rel_path);
-                self.inodes.remove(&inode_path);
-                reply.ok();
-            }
-            PathContext::BranchCtl(_) | PathContext::RootCtl => {
+        if let Some((branch, parent_rel)) = branch_ctx {
+            // Can't unlink @child dirs or .branchfs_ctl
+            if name_str.starts_with('@') || *name_str == *CTL_FILE {
                 reply.error(libc::EPERM);
+                return;
             }
-            PathContext::RootPath(rp) => {
-                // Existing root-path unlink
-                let path = if rp == "/" {
-                    format!("/{}", name_str)
-                } else {
-                    format!("{}/{}", rp, name_str)
-                };
 
-                let result = self.manager.with_branch(&self.get_branch_name(), |b| {
-                    b.add_tombstone(&path)?;
-                    let delta = b.delta_path(&path);
-                    if delta.exists() {
-                        std::fs::remove_file(&delta)?;
-                    }
-                    Ok(())
-                });
+            if !self.manager.is_branch_valid(&branch) {
+                reply.error(libc::ENOENT);
+                return;
+            }
 
-                if result.is_err() || self.is_stale() {
-                    reply.error(libc::ESTALE);
-                    return;
+            let rel_path = if parent_rel == "/" {
+                format!("/{}", name_str)
+            } else {
+                format!("{}/{}", parent_rel, name_str)
+            };
+
+            let result = self.manager.with_branch(&branch, |b| {
+                b.add_tombstone(&rel_path)?;
+                let delta = b.delta_path(&rel_path);
+                if delta.exists() {
+                    std::fs::remove_file(&delta)?;
                 }
+                Ok(())
+            });
 
-                self.inodes.remove(&path);
-                reply.ok();
+            if result.is_err() {
+                reply.error(libc::EIO);
+                return;
+            }
+
+            let inode_path = format!("/@{}{}", branch, rel_path);
+            self.inodes.remove(&inode_path);
+            reply.ok();
+        } else {
+            // Root-path unlink (or EPERM for ctl files)
+            match self.classify_path(&parent_path) {
+                PathContext::BranchCtl(_) | PathContext::RootCtl => {
+                    reply.error(libc::EPERM);
+                }
+                PathContext::RootPath(rp) => {
+                    let path = if rp == "/" {
+                        format!("/{}", name_str)
+                    } else {
+                        format!("{}/{}", rp, name_str)
+                    };
+
+                    let result = self.manager.with_branch(&self.get_branch_name(), |b| {
+                        b.add_tombstone(&path)?;
+                        let delta = b.delta_path(&path);
+                        if delta.exists() {
+                            std::fs::remove_file(&delta)?;
+                        }
+                        Ok(())
+                    });
+
+                    if result.is_err() || self.is_stale() {
+                        reply.error(libc::ESTALE);
+                        return;
+                    }
+
+                    self.inodes.remove(&path);
+                    reply.ok();
+                }
+                _ => {
+                    reply.error(libc::ENOENT);
+                }
             }
         }
     }
@@ -1319,73 +1198,67 @@ impl Filesystem for BranchFs {
 
         let name_str = name.to_string_lossy();
 
-        match self.classify_path(&parent_path) {
-            PathContext::BranchDir(branch) => {
-                if !self.manager.is_branch_valid(&branch) {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
-                let rel_path = format!("/{}", name_str);
-                let delta = self.get_delta_path_for_branch(&branch, &rel_path);
-                match std::fs::create_dir_all(&delta) {
-                    Ok(_) => {
-                        let inode_path = format!("/@{}{}", branch, rel_path);
-                        let ino = self.inodes.get_or_create(&inode_path, true);
-                        if let Some(attr) = self.make_attr(ino, &delta) {
-                            reply.entry(&TTL, &attr, 0);
-                        } else {
-                            reply.error(libc::EIO);
-                        }
-                    }
-                    Err(_) => reply.error(libc::EIO),
-                }
-            }
-            PathContext::BranchPath(branch, parent_rel) => {
-                if !self.manager.is_branch_valid(&branch) {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
-                let rel_path = format!("{}/{}", parent_rel, name_str);
-                let delta = self.get_delta_path_for_branch(&branch, &rel_path);
-                match std::fs::create_dir_all(&delta) {
-                    Ok(_) => {
-                        let inode_path = format!("/@{}{}", branch, rel_path);
-                        let ino = self.inodes.get_or_create(&inode_path, true);
-                        if let Some(attr) = self.make_attr(ino, &delta) {
-                            reply.entry(&TTL, &attr, 0);
-                        } else {
-                            reply.error(libc::EIO);
-                        }
-                    }
-                    Err(_) => reply.error(libc::EIO),
-                }
-            }
-            PathContext::BranchCtl(_) | PathContext::RootCtl => {
-                reply.error(libc::EPERM);
-            }
-            PathContext::RootPath(rp) => {
-                let path = if rp == "/" {
-                    format!("/{}", name_str)
-                } else {
-                    format!("{}/{}", rp, name_str)
-                };
+        let branch_ctx = match self.classify_path(&parent_path) {
+            PathContext::BranchDir(b) => Some((b, "/".to_string())),
+            PathContext::BranchPath(b, rel) => Some((b, rel)),
+            _ => None,
+        };
 
-                let delta = self.get_delta_path(&path);
-                match std::fs::create_dir_all(&delta) {
-                    Ok(_) => {
-                        if self.is_stale() {
-                            let _ = std::fs::remove_dir_all(&delta);
-                            reply.error(libc::ESTALE);
-                            return;
-                        }
-                        let ino = self.inodes.get_or_create(&path, true);
-                        if let Some(attr) = self.make_attr(ino, &delta) {
-                            reply.entry(&TTL, &attr, 0);
-                        } else {
-                            reply.error(libc::EIO);
-                        }
+        if let Some((branch, parent_rel)) = branch_ctx {
+            if !self.manager.is_branch_valid(&branch) {
+                reply.error(libc::ENOENT);
+                return;
+            }
+            let rel_path = if parent_rel == "/" {
+                format!("/{}", name_str)
+            } else {
+                format!("{}/{}", parent_rel, name_str)
+            };
+            let delta = self.get_delta_path_for_branch(&branch, &rel_path);
+            match std::fs::create_dir_all(&delta) {
+                Ok(_) => {
+                    let inode_path = format!("/@{}{}", branch, rel_path);
+                    let ino = self.inodes.get_or_create(&inode_path, true);
+                    if let Some(attr) = self.make_attr(ino, &delta) {
+                        reply.entry(&TTL, &attr, 0);
+                    } else {
+                        reply.error(libc::EIO);
                     }
-                    Err(_) => reply.error(libc::EIO),
+                }
+                Err(_) => reply.error(libc::EIO),
+            }
+        } else {
+            match self.classify_path(&parent_path) {
+                PathContext::BranchCtl(_) | PathContext::RootCtl => {
+                    reply.error(libc::EPERM);
+                }
+                PathContext::RootPath(rp) => {
+                    let path = if rp == "/" {
+                        format!("/{}", name_str)
+                    } else {
+                        format!("{}/{}", rp, name_str)
+                    };
+
+                    let delta = self.get_delta_path(&path);
+                    match std::fs::create_dir_all(&delta) {
+                        Ok(_) => {
+                            if self.is_stale() {
+                                let _ = std::fs::remove_dir_all(&delta);
+                                reply.error(libc::ESTALE);
+                                return;
+                            }
+                            let ino = self.inodes.get_or_create(&path, true);
+                            if let Some(attr) = self.make_attr(ino, &delta) {
+                                reply.entry(&TTL, &attr, 0);
+                            } else {
+                                reply.error(libc::EIO);
+                            }
+                        }
+                        Err(_) => reply.error(libc::EIO),
+                    }
+                }
+                _ => {
+                    reply.error(libc::ENOENT);
                 }
             }
         }
