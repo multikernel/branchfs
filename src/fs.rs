@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyIoctl,
@@ -35,6 +36,8 @@ pub struct BranchFs {
     /// Per-branch ctl inode numbers: branch_name → ino
     pub(crate) branch_ctl_inodes: RwLock<HashMap<String, u64>>,
     pub(crate) next_ctl_ino: AtomicU64,
+    pub(crate) uid: AtomicU32,
+    pub(crate) gid: AtomicU32,
 }
 
 impl BranchFs {
@@ -49,6 +52,8 @@ impl BranchFs {
             // Reserve a range well below CTL_INO (u64::MAX - 1) for branch ctl inodes.
             // Start from u64::MAX - 1_000_000 downward.
             next_ctl_ino: AtomicU64::new(u64::MAX - 1_000_000),
+            uid: AtomicU32::new(nix::unistd::getuid().as_raw()),
+            gid: AtomicU32::new(nix::unistd::getgid().as_raw()),
         }
     }
 
@@ -71,6 +76,48 @@ impl BranchFs {
         self.inodes.clear();
     }
 
+    fn apply_setattr(
+        delta: &Path,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Some(m) = mode {
+            let perm = std::fs::Permissions::from_mode(m);
+            let _ = std::fs::set_permissions(delta, perm);
+        }
+        if uid.is_some() || gid.is_some() {
+            let _ = nix::unistd::chown(
+                delta,
+                uid.map(nix::unistd::Uid::from_raw),
+                gid.map(nix::unistd::Gid::from_raw),
+            );
+        }
+        if atime.is_some() || mtime.is_some() {
+            let to_timespec = |t: Option<TimeOrNow>| -> nix::sys::time::TimeSpec {
+                match t {
+                    Some(TimeOrNow::SpecificTime(st)) => {
+                        let d = st.duration_since(UNIX_EPOCH).unwrap_or_default();
+                        nix::sys::time::TimeSpec::new(d.as_secs() as i64, d.subsec_nanos() as i64)
+                    }
+                    Some(TimeOrNow::Now) => nix::sys::time::TimeSpec::new(0, libc::UTIME_NOW),
+                    None => nix::sys::time::TimeSpec::new(0, libc::UTIME_OMIT),
+                }
+            };
+            let _ = nix::sys::stat::utimensat(
+                None,
+                delta,
+                &to_timespec(atime),
+                &to_timespec(mtime),
+                nix::sys::stat::UtimensatFlags::FollowSymlink,
+            );
+        }
+    }
+
     /// Classify an inode number. Returns None for root and CTL_INO (handled separately).
     fn classify_ino(&self, ino: u64) -> Option<PathContext> {
         if ino == ROOT_INO {
@@ -89,6 +136,21 @@ impl BranchFs {
 }
 
 impl Filesystem for BranchFs {
+    fn init(
+        &mut self,
+        req: &Request,
+        _config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        // The init request may come from the kernel (uid=0) rather than the
+        // mounting user, so only override the process-derived defaults when
+        // the request carries a real (non-root) uid.
+        if req.uid() != 0 {
+            self.uid.store(req.uid(), Ordering::Relaxed);
+            self.gid.store(req.gid(), Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let name_str = name.to_string_lossy();
 
@@ -619,8 +681,8 @@ impl Filesystem for BranchFs {
         _req: &Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         _flags: i32,
         reply: fuser::ReplyCreate,
     ) {
@@ -658,6 +720,9 @@ impl Filesystem for BranchFs {
             }
             match std::fs::File::create(&delta) {
                 Ok(_) => {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perm = std::fs::Permissions::from_mode(mode & !umask);
+                    let _ = std::fs::set_permissions(&delta, perm);
                     let inode_path = format!("/@{}{}", branch, rel_path);
                     let ino = self.inodes.get_or_create(&inode_path, false);
                     if let Some(attr) = self.make_attr(ino, &delta) {
@@ -689,6 +754,9 @@ impl Filesystem for BranchFs {
 
                     match std::fs::File::create(&delta) {
                         Ok(_) => {
+                            use std::os::unix::fs::PermissionsExt;
+                            let perm = std::fs::Permissions::from_mode(mode & !umask);
+                            let _ = std::fs::set_permissions(&delta, perm);
                             if self.is_stale() {
                                 let _ = std::fs::remove_file(&delta);
                                 reply.error(libc::ESTALE);
@@ -865,12 +933,12 @@ impl Filesystem for BranchFs {
         &mut self,
         _req: &Request,
         ino: u64,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<u64>,
         _crtime: Option<SystemTime>,
@@ -920,6 +988,16 @@ impl Filesystem for BranchFs {
                         }
                     }
                 }
+                if mode.is_some()
+                    || uid.is_some()
+                    || gid.is_some()
+                    || atime.is_some()
+                    || mtime.is_some()
+                {
+                    if let Ok(delta) = self.ensure_cow_for_branch(&branch, &rel_path) {
+                        Self::apply_setattr(&delta, mode, uid, gid, atime, mtime);
+                    }
+                }
                 if let Some(resolved) = self.resolve_for_branch(&branch, &rel_path) {
                     if let Some(attr) = self.make_attr(ino, &resolved) {
                         reply.attr(&TTL, &attr);
@@ -936,6 +1014,16 @@ impl Filesystem for BranchFs {
                         if let Ok(f) = file {
                             let _ = f.set_len(new_size);
                         }
+                    }
+                }
+                if mode.is_some()
+                    || uid.is_some()
+                    || gid.is_some()
+                    || atime.is_some()
+                    || mtime.is_some()
+                {
+                    if let Ok(delta) = self.ensure_cow(&path) {
+                        Self::apply_setattr(&delta, mode, uid, gid, atime, mtime);
                     }
                 }
 
@@ -1009,8 +1097,8 @@ impl Filesystem for BranchFs {
         _req: &Request,
         parent: u64,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
         let parent_path = match self.inodes.get_path(parent) {
@@ -1042,6 +1130,9 @@ impl Filesystem for BranchFs {
             let delta = self.get_delta_path_for_branch(&branch, &rel_path);
             match std::fs::create_dir_all(&delta) {
                 Ok(_) => {
+                    use std::os::unix::fs::PermissionsExt;
+                    let perm = std::fs::Permissions::from_mode(mode & !umask);
+                    let _ = std::fs::set_permissions(&delta, perm);
                     let inode_path = format!("/@{}{}", branch, rel_path);
                     let ino = self.inodes.get_or_create(&inode_path, true);
                     if let Some(attr) = self.make_attr(ino, &delta) {
@@ -1067,6 +1158,9 @@ impl Filesystem for BranchFs {
                     let delta = self.get_delta_path(&path);
                     match std::fs::create_dir_all(&delta) {
                         Ok(_) => {
+                            use std::os::unix::fs::PermissionsExt;
+                            let perm = std::fs::Permissions::from_mode(mode & !umask);
+                            let _ = std::fs::set_permissions(&delta, perm);
                             if self.is_stale() {
                                 let _ = std::fs::remove_dir_all(&delta);
                                 reply.error(libc::ESTALE);

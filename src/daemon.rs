@@ -151,7 +151,10 @@ impl Daemon {
         )?);
 
         let fs = BranchFs::new(manager.clone(), branch_name.to_string());
-        let options = vec![MountOption::FSName("branchfs".to_string())];
+        let options = vec![
+            MountOption::FSName("branchfs".to_string()),
+            MountOption::DefaultPermissions,
+        ];
 
         log::info!(
             "Spawning mount for branch '{}' at {:?} with storage {:?}",
