@@ -87,6 +87,34 @@ impl Branch {
     }
 }
 
+fn validate_branch_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(BranchError::Invalid("branch name cannot be empty".into()));
+    }
+    if name == "." || name == ".." {
+        return Err(BranchError::Invalid(format!(
+            "'{}' is not a valid branch name",
+            name
+        )));
+    }
+    if name.contains('/') || name.contains('\0') {
+        return Err(BranchError::Invalid(
+            "branch name cannot contain '/' or null bytes".into(),
+        ));
+    }
+    if name.starts_with('@') {
+        return Err(BranchError::Invalid(
+            "branch name cannot start with '@' (reserved for virtual paths)".into(),
+        ));
+    }
+    if name.len() > 255 {
+        return Err(BranchError::Invalid(
+            "branch name cannot exceed 255 characters".into(),
+        ));
+    }
+    Ok(())
+}
+
 pub struct BranchManager {
     pub storage_path: PathBuf,
     pub base_path: PathBuf,
@@ -122,6 +150,8 @@ impl BranchManager {
     }
 
     pub fn create_branch(&self, name: &str, parent: &str) -> Result<()> {
+        validate_branch_name(name)?;
+
         let mut branches = self.branches.write();
 
         if branches.contains_key(name) {
