@@ -11,6 +11,7 @@ BranchFS is a FUSE-based filesystem that enables speculative branching on top of
 | Atomic Abort | Instantly invalidates branch, sibling branches unaffected |
 | Atomic Commit | Applies changes and invalidates all branches atomically |
 | mmap Invalidation | Memory-mapped files trigger SIGBUS after commit/abort |
+| @branch Virtual Paths | Access any branch directly via `/@branch-name/` without switching |
 | Portable | Works on any underlying filesystem (ext4, xfs, nfs, etc.) |
 
 ## Architecture
@@ -109,6 +110,41 @@ echo "deep change" > /mnt/workspace/file.txt
 branchfs commit /mnt/workspace
 ```
 
+### @branch Virtual Paths
+
+Every non-main branch is accessible as a virtual directory at the mount root, without switching the current branch:
+
+```bash
+branchfs mount --base ~/project /mnt/workspace
+
+# Create two branches
+branchfs create feature-a /mnt/workspace
+branchfs create feature-b /mnt/workspace
+
+# Access both branches simultaneously via @branch paths
+cat /mnt/workspace/@feature-a/file.txt
+cat /mnt/workspace/@feature-b/file.txt
+
+# Write to a specific branch without switching
+echo "change" > /mnt/workspace/@feature-a/src/main.rs
+
+# Each @branch has its own control file
+echo "commit" > /mnt/workspace/@feature-a/.branchfs_ctl
+echo "abort" > /mnt/workspace/@feature-b/.branchfs_ctl
+```
+
+Nested branches can be accessed at both `/@child/` and `/@parent/@child/`:
+
+```bash
+branchfs create child /mnt/workspace -p feature-a
+
+# Both paths reach the same branch
+cat /mnt/workspace/@child/file.txt
+cat /mnt/workspace/@feature-a/@child/file.txt
+```
+
+This is useful for multi-agent workflows where each agent can bind-mount a different `@branch` path to work on isolated branches in parallel within the same mount.
+
 ### Parallel Speculation (Multiple Mount Points)
 
 Each mount has its own isolated branch namespace:
@@ -137,7 +173,7 @@ cat /mnt/approach-b/solution.py  # still works
 
 ### Per-Mount Isolation
 
-Each mount point has its own isolated branch namespace. Branches created in one mount are not visible to other mounts, even if they share the same base directory. This enables true parallel speculation without interference.
+Each mount point has its own isolated branch namespace. Branches created in one mount are not visible to other mounts, even if they share the same base directory. This includes `@branch` virtual paths — `/@feature-a` on one mount has no relation to `/@feature-a` on another mount, even if they share the same base. This enables true parallel speculation without interference.
 
 ### Commit
 
