@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::fs::File;
+use std::io::{Read as IoRead, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -397,14 +399,16 @@ impl Filesystem for BranchFs {
                         return;
                     }
                 };
-                match std::fs::read(&resolved) {
-                    Ok(data) => {
-                        let start = offset as usize;
-                        let end = std::cmp::min(start + size as usize, data.len());
-                        if start < data.len() {
-                            reply.data(&data[start..end]);
-                        } else {
-                            reply.data(&[]);
+                match File::open(&resolved) {
+                    Ok(mut file) => {
+                        if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+                            reply.error(libc::EIO);
+                            return;
+                        }
+                        let mut buf = vec![0u8; size as usize];
+                        match file.read(&mut buf) {
+                            Ok(n) => reply.data(&buf[..n]),
+                            Err(_) => reply.error(libc::EIO),
                         }
                     }
                     Err(_) => reply.error(libc::EIO),
@@ -436,18 +440,22 @@ impl Filesystem for BranchFs {
                     }
                 };
 
-                match std::fs::read(&resolved) {
-                    Ok(data) => {
-                        if self.is_stale() {
-                            reply.error(libc::ESTALE);
+                match File::open(&resolved) {
+                    Ok(mut file) => {
+                        if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+                            reply.error(libc::EIO);
                             return;
                         }
-                        let start = offset as usize;
-                        let end = std::cmp::min(start + size as usize, data.len());
-                        if start < data.len() {
-                            reply.data(&data[start..end]);
-                        } else {
-                            reply.data(&[]);
+                        let mut buf = vec![0u8; size as usize];
+                        match file.read(&mut buf) {
+                            Ok(n) => {
+                                if self.is_stale() {
+                                    reply.error(libc::ESTALE);
+                                    return;
+                                }
+                                reply.data(&buf[..n])
+                            }
+                            Err(_) => reply.error(libc::EIO),
                         }
                     }
                     Err(_) => reply.error(libc::EIO),

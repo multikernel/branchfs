@@ -4,6 +4,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use fuser::Notifier;
 use parking_lot::{Mutex, RwLock};
@@ -150,6 +151,7 @@ impl BranchManager {
     }
 
     pub fn create_branch(&self, name: &str, parent: &str) -> Result<()> {
+        let start = Instant::now();
         validate_branch_name(name)?;
 
         let mut branches = self.branches.write();
@@ -164,6 +166,14 @@ impl BranchManager {
 
         let branch = Branch::new(name, Some(parent), &self.storage_path)?;
         branches.insert(name.to_string(), branch);
+
+        let elapsed = start.elapsed();
+        log::debug!(
+            "[BENCH] create_branch '{}': {:?} ({} us)",
+            name,
+            elapsed,
+            elapsed.as_micros()
+        );
 
         Ok(())
     }
@@ -359,6 +369,7 @@ impl BranchManager {
     }
 
     pub fn commit(&self, branch_name: &str) -> Result<()> {
+        let start = Instant::now();
         if branch_name == "main" {
             return Err(BranchError::CannotOperateOnMain);
         }
@@ -367,6 +378,13 @@ impl BranchManager {
 
         let chain = self.get_branch_chain(branch_name, &branches)?;
         let (deletions, files) = self.collect_changes(&chain, &branches)?;
+        let num_deletions = deletions.len();
+        let num_files = files.len();
+        let total_bytes: u64 = files
+            .iter()
+            .filter_map(|(_, p)| p.metadata().ok())
+            .map(|m| m.len())
+            .sum();
 
         for path in &deletions {
             let full_path = self.base_path.join(path.trim_start_matches('/'));
@@ -398,10 +416,22 @@ impl BranchManager {
         drop(branches);
         self.invalidate_all_mounts();
 
+        let elapsed = start.elapsed();
+        log::debug!(
+            "[BENCH] commit '{}': {:?} ({} us), {} deletions, {} files, {} bytes",
+            branch_name,
+            elapsed,
+            elapsed.as_micros(),
+            num_deletions,
+            num_files,
+            total_bytes
+        );
+
         Ok(())
     }
 
     pub fn abort(&self, branch_name: &str) -> Result<()> {
+        let start = Instant::now();
         if branch_name == "main" {
             return Err(BranchError::CannotOperateOnMain);
         }
@@ -430,6 +460,14 @@ impl BranchManager {
         // Must be done after releasing the branches lock
         drop(branches);
         self.invalidate_branches(&aborted_branches);
+
+        let elapsed = start.elapsed();
+        log::debug!(
+            "[BENCH] abort '{}': {:?} ({} us)",
+            branch_name,
+            elapsed,
+            elapsed.as_micros()
+        );
 
         Ok(())
     }
