@@ -168,7 +168,12 @@ impl BranchManager {
         branches.insert(name.to_string(), branch);
 
         let elapsed = start.elapsed();
-        log::debug!("[BENCH] create_branch '{}': {:?} ({} us)", name, elapsed, elapsed.as_micros());
+        log::debug!(
+            "[BENCH] create_branch '{}': {:?} ({} us)",
+            name,
+            elapsed,
+            elapsed.as_micros()
+        );
 
         Ok(())
     }
@@ -375,7 +380,11 @@ impl BranchManager {
         let (deletions, files) = self.collect_changes(&chain, &branches)?;
         let num_deletions = deletions.len();
         let num_files = files.len();
-        let total_bytes: u64 = files.iter().filter_map(|(_, p)| p.metadata().ok()).map(|m| m.len()).sum();
+        let total_bytes: u64 = files
+            .iter()
+            .filter_map(|(_, p)| p.metadata().ok())
+            .map(|m| m.len())
+            .sum();
 
         for path in &deletions {
             let full_path = self.base_path.join(path.trim_start_matches('/'));
@@ -408,8 +417,15 @@ impl BranchManager {
         self.invalidate_all_mounts();
 
         let elapsed = start.elapsed();
-        log::debug!("[BENCH] commit '{}': {:?} ({} us), {} deletions, {} files, {} bytes",
-            branch_name, elapsed, elapsed.as_micros(), num_deletions, num_files, total_bytes);
+        log::debug!(
+            "[BENCH] commit '{}': {:?} ({} us), {} deletions, {} files, {} bytes",
+            branch_name,
+            elapsed,
+            elapsed.as_micros(),
+            num_deletions,
+            num_files,
+            total_bytes
+        );
 
         Ok(())
     }
@@ -446,7 +462,12 @@ impl BranchManager {
         self.invalidate_branches(&aborted_branches);
 
         let elapsed = start.elapsed();
-        log::debug!("[BENCH] abort '{}': {:?} ({} us)", branch_name, elapsed, elapsed.as_micros());
+        log::debug!(
+            "[BENCH] abort '{}': {:?} ({} us)",
+            branch_name,
+            elapsed,
+            elapsed.as_micros()
+        );
 
         Ok(())
     }

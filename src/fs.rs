@@ -401,7 +401,7 @@ impl Filesystem for BranchFs {
                 };
                 match File::open(&resolved) {
                     Ok(mut file) => {
-                        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
+                        if file.seek(SeekFrom::Start(offset as u64)).is_err() {
                             reply.error(libc::EIO);
                             return;
                         }
@@ -442,7 +442,7 @@ impl Filesystem for BranchFs {
 
                 match File::open(&resolved) {
                     Ok(mut file) => {
-                        if let Err(_) = file.seek(SeekFrom::Start(offset as u64)) {
+                        if file.seek(SeekFrom::Start(offset as u64)).is_err() {
                             reply.error(libc::EIO);
                             return;
                         }
