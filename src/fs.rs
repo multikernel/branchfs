@@ -30,6 +30,88 @@ pub const BRANCHFS_IOC_ABORT: u32 = 0x4202;
 pub(crate) const CTL_FILE: &str = ".branchfs_ctl";
 pub(crate) const CTL_INO: u64 = u64::MAX - 1;
 
+/// Cached open file descriptor for the most recently read inode.
+/// Eliminates per-read resolve_path() (2-3 stat syscalls on non-existent
+/// delta paths) and File::open()/close() overhead.  Invalidated on write
+/// (COW changes the backing path) and on epoch change (branch switch).
+struct OpenFileCache {
+    ino: u64,
+    epoch: u64,
+    file: Option<File>,
+}
+
+impl OpenFileCache {
+    fn new() -> Self {
+        Self {
+            ino: 0,
+            epoch: 0,
+            file: None,
+        }
+    }
+
+    /// Return a mutable reference to the cached File if it matches.
+    fn get(&mut self, ino: u64, epoch: u64) -> Option<&mut File> {
+        if self.ino == ino && self.epoch == epoch {
+            self.file.as_mut()
+        } else {
+            None
+        }
+    }
+
+    /// Replace the cached entry.
+    fn insert(&mut self, ino: u64, epoch: u64, file: File) {
+        self.ino = ino;
+        self.epoch = epoch;
+        self.file = Some(file);
+    }
+
+    fn invalidate_ino(&mut self, ino: u64) {
+        if self.ino == ino {
+            self.ino = 0;
+            self.file = None;
+        }
+    }
+}
+
+/// Cached open file descriptor for writes (delta files).
+/// Same idea as OpenFileCache but opened in write mode.
+struct WriteFileCache {
+    ino: u64,
+    epoch: u64,
+    file: Option<File>,
+}
+
+impl WriteFileCache {
+    fn new() -> Self {
+        Self {
+            ino: 0,
+            epoch: 0,
+            file: None,
+        }
+    }
+
+    fn get(&mut self, ino: u64, epoch: u64) -> Option<&mut File> {
+        if self.ino == ino && self.epoch == epoch {
+            self.file.as_mut()
+        } else {
+            None
+        }
+    }
+
+    fn insert(&mut self, ino: u64, epoch: u64, file: File) {
+        self.ino = ino;
+        self.epoch = epoch;
+        self.file = Some(file);
+    }
+
+    fn invalidate_ino(&mut self, ino: u64) {
+        if self.ino == ino {
+            self.ino = 0;
+            self.file = None;
+        }
+    }
+}
+
 pub struct BranchFs {
     pub(crate) manager: Arc<BranchManager>,
     pub(crate) inodes: InodeManager,
@@ -40,6 +122,12 @@ pub struct BranchFs {
     pub(crate) next_ctl_ino: AtomicU64,
     pub(crate) uid: AtomicU32,
     pub(crate) gid: AtomicU32,
+    /// Cached open file — avoids re-resolve + re-open on consecutive reads
+    /// to the same inode.
+    open_cache: OpenFileCache,
+    /// Cached write fd — avoids re-open on consecutive writes to the same
+    /// delta file (after COW).
+    write_cache: WriteFileCache,
 }
 
 impl BranchFs {
@@ -56,6 +144,8 @@ impl BranchFs {
             next_ctl_ino: AtomicU64::new(u64::MAX - 1_000_000),
             uid: AtomicU32::new(nix::unistd::getuid().as_raw()),
             gid: AtomicU32::new(nix::unistd::getgid().as_raw()),
+            open_cache: OpenFileCache::new(),
+            write_cache: WriteFileCache::new(),
         }
     }
 
@@ -76,6 +166,7 @@ impl BranchFs {
             .store(self.manager.get_epoch(), Ordering::SeqCst);
         // Clear inode cache since we're on a different branch now
         self.inodes.clear();
+        // Note: read_cache is invalidated automatically via epoch mismatch
     }
 
     fn apply_setattr(
@@ -150,6 +241,7 @@ impl Filesystem for BranchFs {
             self.uid.store(req.uid(), Ordering::Relaxed);
             self.gid.store(req.gid(), Ordering::Relaxed);
         }
+
         Ok(())
     }
 
@@ -386,7 +478,25 @@ impl Filesystem for BranchFs {
         _lock: Option<u64>,
         reply: ReplyData,
     ) {
-        match self.classify_ino(ino) {
+        let epoch = self.current_epoch.load(Ordering::SeqCst);
+
+        // Fast path: reuse cached fd for the same inode+epoch (avoids
+        // resolve_path's stat() calls and File::open()/close() every time).
+        if let Some(file) = self.open_cache.get(ino, epoch) {
+            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+                reply.error(libc::EIO);
+                return;
+            }
+            let mut buf = vec![0u8; size as usize];
+            match file.read(&mut buf) {
+                Ok(n) => reply.data(&buf[..n]),
+                Err(_) => reply.error(libc::EIO),
+            }
+            return;
+        }
+
+        // Slow path: resolve + open, then cache the fd.
+        let is_root = match self.classify_ino(ino) {
             Some(PathContext::BranchPath(branch, rel_path)) => {
                 if !self.manager.is_branch_valid(&branch) {
                     reply.error(libc::ENOENT);
@@ -400,30 +510,25 @@ impl Filesystem for BranchFs {
                     }
                 };
                 match File::open(&resolved) {
-                    Ok(mut file) => {
-                        if file.seek(SeekFrom::Start(offset as u64)).is_err() {
-                            reply.error(libc::EIO);
-                            return;
-                        }
-                        let mut buf = vec![0u8; size as usize];
-                        match file.read(&mut buf) {
-                            Ok(n) => reply.data(&buf[..n]),
-                            Err(_) => reply.error(libc::EIO),
-                        }
+                    Ok(file) => {
+                        self.open_cache.insert(ino, epoch, file);
+                        false
                     }
-                    Err(_) => reply.error(libc::EIO),
+                    Err(_) => {
+                        reply.error(libc::EIO);
+                        return;
+                    }
                 }
             }
             Some(PathContext::BranchDir(_)) | Some(PathContext::BranchCtl(_)) => {
                 reply.error(libc::EISDIR);
+                return;
             }
             _ => {
-                // Root path or root ctl
                 if self.is_stale() {
                     reply.error(libc::ESTALE);
                     return;
                 }
-
                 let path = match self.inodes.get_path(ino) {
                     Some(p) => p,
                     None => {
@@ -431,7 +536,6 @@ impl Filesystem for BranchFs {
                         return;
                     }
                 };
-
                 let resolved = match self.resolve(&path) {
                     Some(p) => p,
                     None => {
@@ -439,28 +543,38 @@ impl Filesystem for BranchFs {
                         return;
                     }
                 };
-
                 match File::open(&resolved) {
-                    Ok(mut file) => {
-                        if file.seek(SeekFrom::Start(offset as u64)).is_err() {
-                            reply.error(libc::EIO);
-                            return;
-                        }
-                        let mut buf = vec![0u8; size as usize];
-                        match file.read(&mut buf) {
-                            Ok(n) => {
-                                if self.is_stale() {
-                                    reply.error(libc::ESTALE);
-                                    return;
-                                }
-                                reply.data(&buf[..n])
-                            }
-                            Err(_) => reply.error(libc::EIO),
-                        }
+                    Ok(file) => {
+                        self.open_cache.insert(ino, epoch, file);
+                        true
                     }
-                    Err(_) => reply.error(libc::EIO),
+                    Err(_) => {
+                        reply.error(libc::EIO);
+                        return;
+                    }
                 }
             }
+        };
+
+        // Now serve from the just-cached fd
+        if let Some(file) = self.open_cache.get(ino, epoch) {
+            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+                reply.error(libc::EIO);
+                return;
+            }
+            let mut buf = vec![0u8; size as usize];
+            match file.read(&mut buf) {
+                Ok(n) => {
+                    if is_root && self.is_stale() {
+                        reply.error(libc::ESTALE);
+                        return;
+                    }
+                    reply.data(&buf[..n])
+                }
+                Err(_) => reply.error(libc::EIO),
+            }
+        } else {
+            reply.error(libc::EIO);
         }
     }
 
@@ -476,6 +590,10 @@ impl Filesystem for BranchFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
+        // Invalidate read cache — COW will redirect to delta, so the cached
+        // read fd (pointing to base) becomes wrong.
+        self.open_cache.invalidate_ino(ino);
+
         // === Root ctl file ===
         if ino == CTL_INO {
             self.handle_root_ctl_write(data, reply);
@@ -488,7 +606,24 @@ impl Filesystem for BranchFs {
             return;
         }
 
-        // === Branch path write ===
+        let epoch = self.current_epoch.load(Ordering::SeqCst);
+
+        // Fast path: reuse cached write fd for consecutive writes
+        // to the same inode (after COW is already done).
+        if let Some(file) = self.write_cache.get(ino, epoch) {
+            use std::io::{Seek, SeekFrom, Write};
+            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+                reply.error(libc::EIO);
+                return;
+            }
+            match file.write(data) {
+                Ok(n) => reply.written(n as u32),
+                Err(_) => reply.error(libc::EIO),
+            }
+            return;
+        }
+
+        // Slow path: resolve, ensure COW, open delta, cache fd.
         let path = match self.inodes.get_path(ino) {
             Some(p) => p,
             None => {
@@ -497,47 +632,68 @@ impl Filesystem for BranchFs {
             }
         };
 
-        match classify_path(&path) {
+        let (delta, is_root) = match classify_path(&path) {
             PathContext::BranchDir(_) | PathContext::BranchCtl(_) => {
                 reply.error(libc::EPERM);
+                return;
             }
             PathContext::BranchPath(branch, rel_path) => {
                 if !self.manager.is_branch_valid(&branch) {
                     reply.error(libc::ENOENT);
                     return;
                 }
-                let delta = match self.ensure_cow_for_branch(&branch, &rel_path) {
-                    Ok(p) => p,
+                match self.ensure_cow_for_branch(&branch, &rel_path) {
+                    Ok(p) => (p, false),
                     Err(_) => {
                         reply.error(libc::EIO);
                         return;
                     }
-                };
-                match Self::write_to_delta(&delta, offset, data) {
-                    Ok(n) => reply.written(n),
-                    Err(e) => reply.error(e),
                 }
             }
-            _ => {
-                // Root path write (existing logic)
-                let delta = match self.ensure_cow(&path) {
-                    Ok(p) => p,
-                    Err(_) => {
-                        reply.error(libc::EIO);
+            _ => match self.ensure_cow(&path) {
+                Ok(p) => (p, true),
+                Err(_) => {
+                    reply.error(libc::EIO);
+                    return;
+                }
+            },
+        };
+
+        // Open delta for writing and cache the fd
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&delta)
+        {
+            Ok(file) => {
+                self.write_cache.insert(ino, epoch, file);
+            }
+            Err(_) => {
+                reply.error(libc::EIO);
+                return;
+            }
+        }
+
+        // Serve from the just-cached write fd
+        if let Some(file) = self.write_cache.get(ino, epoch) {
+            use std::io::{Seek, SeekFrom, Write};
+            if file.seek(SeekFrom::Start(offset as u64)).is_err() {
+                reply.error(libc::EIO);
+                return;
+            }
+            match file.write(data) {
+                Ok(n) => {
+                    if is_root && self.is_stale() {
+                        reply.error(libc::ESTALE);
                         return;
                     }
-                };
-                match Self::write_to_delta(&delta, offset, data) {
-                    Ok(n) => {
-                        if self.is_stale() {
-                            reply.error(libc::ESTALE);
-                            return;
-                        }
-                        reply.written(n)
-                    }
-                    Err(e) => reply.error(e),
+                    reply.written(n as u32)
                 }
+                Err(_) => reply.error(libc::EIO),
             }
+        } else {
+            reply.error(libc::EIO);
         }
     }
 
@@ -955,6 +1111,12 @@ impl Filesystem for BranchFs {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
+        // Truncation triggers COW — invalidate cached fds
+        if size.is_some() {
+            self.open_cache.invalidate_ino(ino);
+            self.write_cache.invalidate_ino(ino);
+        }
+
         // Handle root ctl file (virtual — not in inode table)
         if ino == CTL_INO {
             reply.attr(&TTL, &self.ctl_file_attr(CTL_INO));

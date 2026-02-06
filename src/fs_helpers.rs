@@ -135,24 +135,6 @@ impl BranchFs {
         }
     }
 
-    /// Write data to a delta file at the given offset.
-    pub(crate) fn write_to_delta(
-        delta: &std::path::Path,
-        offset: i64,
-        data: &[u8],
-    ) -> std::result::Result<u32, i32> {
-        use std::io::{Seek, SeekFrom, Write};
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(delta)
-            .map_err(|_| libc::EIO)?;
-        f.seek(SeekFrom::Start(offset as u64))
-            .map_err(|_| libc::EIO)?;
-        f.write(data).map(|n| n as u32).map_err(|_| libc::EIO)
-    }
-
     /// Collect readdir entries for a directory resolved via a specific branch.
     ///
     /// `inode_prefix` controls how child inode paths are formed:
