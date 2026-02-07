@@ -1230,9 +1230,9 @@ impl Filesystem for BranchFs {
             BRANCHFS_IOC_COMMIT => {
                 log::info!("ioctl: COMMIT for branch '{}'", branch_name);
                 match self.manager.commit(&branch_name) {
-                    Ok(()) => {
-                        self.switch_to_branch("main");
-                        log::info!("Switched to main branch after commit");
+                    Ok(parent) => {
+                        self.switch_to_branch(&parent);
+                        log::info!("Switched to branch '{}' after commit", parent);
                         reply.ioctl(0, &[])
                     }
                     Err(e) => {
@@ -1244,9 +1244,9 @@ impl Filesystem for BranchFs {
             BRANCHFS_IOC_ABORT => {
                 log::info!("ioctl: ABORT for branch '{}'", branch_name);
                 match self.manager.abort(&branch_name) {
-                    Ok(()) => {
-                        self.switch_to_branch("main");
-                        log::info!("Switched to main branch after abort");
+                    Ok(parent) => {
+                        self.switch_to_branch(&parent);
+                        log::info!("Switched to branch '{}' after abort", parent);
                         reply.ioctl(0, &[])
                     }
                     Err(e) => {

@@ -23,6 +23,7 @@ pub enum Request {
     Unmount { mountpoint: String },
     Create { name: String, parent: String },
     NotifySwitch { mountpoint: String, branch: String },
+    GetMountBranch { mountpoint: String },
     List,
     Shutdown,
 }
@@ -324,6 +325,15 @@ impl Daemon {
                         branch
                     );
                     Response::success()
+                } else {
+                    Response::error(&format!("Mount not found: {:?}", path))
+                }
+            }
+            Request::GetMountBranch { mountpoint } => {
+                let path = PathBuf::from(&mountpoint);
+                let mounts = self.mounts.lock();
+                if let Some(info) = mounts.get(&path) {
+                    Response::success_with_data(serde_json::json!(info.current_branch))
                 } else {
                     Response::error(&format!("Mount not found: {:?}", path))
                 }

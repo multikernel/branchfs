@@ -121,6 +121,12 @@ do_abort() {
     "$BRANCHFS" abort "$TEST_MNT" --storage "$TEST_STORAGE"
 }
 
+# Switch to a branch by writing to the ctl file
+do_switch() {
+    local name="$1"
+    echo -n "switch:${name}" > "$TEST_MNT/.branchfs_ctl"
+}
+
 # List branches
 do_list() {
     "$BRANCHFS" list --storage "$TEST_STORAGE"

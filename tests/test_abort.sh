@@ -49,7 +49,7 @@ test_abort_switches_to_main() {
     do_unmount
 }
 
-test_abort_nested_discards_chain() {
+test_abort_nested_discards_leaf_only() {
     setup
     do_mount
 
@@ -60,16 +60,16 @@ test_abort_nested_discards_chain() {
     do_create "abort_n2" "abort_n1"
     echo "n2 content" > "$TEST_MNT/n2_file.txt"
 
-    # Abort from n2 should discard both n2 and n1
+    # Abort from n2 should discard only n2, n1 still exists
     do_abort
 
-    # Both branches should be gone
-    assert_branch_not_exists "abort_n1" "n1 removed after abort"
+    # n2 should be gone, n1 should still exist
     assert_branch_not_exists "abort_n2" "n2 removed after abort"
+    assert_branch_exists "abort_n1" "n1 still exists after n2 abort"
 
-    # Files should not be visible
-    assert_file_not_exists "$TEST_MNT/n1_file.txt" "n1 file gone"
-    assert_file_not_exists "$TEST_MNT/n2_file.txt" "n2 file gone"
+    # n2 file should not be visible, but n1 file should be via @branch
+    assert_file_not_exists "$TEST_MNT/n2_file.txt" "n2 file gone from current view"
+    assert_file_exists "$TEST_MNT/@abort_n1/n1_file.txt" "n1 file still visible via @abort_n1"
 
     # Base unchanged
     assert_file_not_exists "$TEST_BASE/n1_file.txt" "No n1 file in base"
@@ -120,11 +120,38 @@ test_abort_main_fails() {
     do_unmount
 }
 
+test_abort_non_leaf_fails() {
+    setup
+    do_mount
+
+    # Create A from main, then B from A
+    do_create "branch_a" "main"
+    do_create "branch_b" "branch_a"
+
+    # Try to abort A (not a leaf, should fail)
+    if do_switch "branch_a" && "$BRANCHFS" abort "$TEST_MNT" --storage "$TEST_STORAGE" 2>/dev/null; then
+        TESTS_RUN=$((TESTS_RUN + 1))
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}✗${NC} Abort non-leaf should fail"
+    else
+        TESTS_RUN=$((TESTS_RUN + 1))
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}✓${NC} Abort non-leaf correctly failed"
+    fi
+
+    # Both branches should still exist
+    assert_branch_exists "branch_a" "branch_a still exists after failed abort"
+    assert_branch_exists "branch_b" "branch_b still exists after failed abort"
+
+    do_unmount
+}
+
 # Run tests
 run_test "Abort Discards Changes" test_abort_discards_changes
 run_test "Abort Switches to Main" test_abort_switches_to_main
-run_test "Abort Nested Discards Chain" test_abort_nested_discards_chain
+run_test "Abort Nested Discards Leaf Only" test_abort_nested_discards_leaf_only
 run_test "Abort Preserves Siblings" test_abort_preserves_siblings
 run_test "Abort Main Fails" test_abort_main_fails
+run_test "Abort Non-Leaf Fails" test_abort_non_leaf_fails
 
 print_summary
