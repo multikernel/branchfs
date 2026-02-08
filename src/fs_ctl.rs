@@ -70,10 +70,9 @@ impl BranchFs {
         };
 
         match result {
-            Ok(()) => {
-                // Switch to main branch after successful commit/abort (like DAXFS remount)
-                self.switch_to_branch("main");
-                log::info!("Switched to main branch after {}", cmd_lower);
+            Ok(parent) => {
+                self.switch_to_branch(&parent);
+                log::info!("Switched to branch '{}' after {}", parent, cmd_lower);
                 reply.written(data.len() as u32)
             }
             Err(e) => {
@@ -100,20 +99,18 @@ impl BranchFs {
         };
 
         match result {
-            Ok(()) => {
-                if cmd_lower == "commit" {
-                    // Commit clears all branches and increments epoch → clear everything
-                    self.inodes.clear();
-                    self.current_epoch
-                        .store(self.manager.get_epoch(), Ordering::SeqCst);
-                    *self.branch_name.write() = "main".to_string();
-                } else {
-                    // Abort: clear inodes for the aborted branch prefix
-                    self.inodes.clear_prefix(&format!("/@{}", branch));
-                    // Also clear any child branches that may have been aborted
-                    // (abort removes the whole chain)
-                }
-                log::info!("Branch ctl {} succeeded for '{}'", cmd_lower, branch);
+            Ok(parent) => {
+                // Clear inodes for the affected branch prefix and update epoch
+                self.inodes.clear_prefix(&format!("/@{}", branch));
+                self.current_epoch
+                    .store(self.manager.get_epoch(), Ordering::SeqCst);
+                *self.branch_name.write() = parent.clone();
+                log::info!(
+                    "Branch ctl {} succeeded for '{}', switched to '{}'",
+                    cmd_lower,
+                    branch,
+                    parent
+                );
                 reply.written(data.len() as u32)
             }
             Err(e) => {

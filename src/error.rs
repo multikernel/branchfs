@@ -20,6 +20,9 @@ pub enum BranchError {
     #[error("cannot operate on main branch")]
     CannotOperateOnMain,
 
+    #[error("cannot commit/abort non-leaf branch '{0}'")]
+    NotALeaf(String),
+
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 

@@ -1,22 +1,22 @@
 # BranchFS
 
-BranchFS is a FUSE-based filesystem that enables speculative branching on top of any existing filesystem. It gives AI agents isolated workspaces with instant copy-on-write branching, atomic commit-to-root, and zero-cost abort, no root privileges required.
+BranchFS is a FUSE-based filesystem that enables speculative branching on top of any existing filesystem. It gives AI agents isolated workspaces with instant copy-on-write branching, atomic commit-to-parent, and zero-cost abort, no root privileges required.
 
 ## Features
 
 | Feature | Description |
 |---------|-------------|
 | Fast Branch Creation | O(1) branch creation with copy-on-write semantics |
-| Commit to Root | Changes apply directly to the base filesystem |
-| Atomic Abort | Instantly invalidates branch, sibling branches unaffected |
-| Atomic Commit | Applies changes and invalidates all branches atomically |
+| Commit to Parent | Changes merge into immediate parent branch (or base if parent is main) |
+| Atomic Abort | Instantly discards leaf branch, parent and siblings unaffected |
+| Atomic Commit | Merges leaf branch into parent atomically |
 | mmap Invalidation | Memory-mapped files trigger SIGBUS after commit/abort |
 | @branch Virtual Paths | Access any branch directly via `/@branch-name/` without switching |
 | Portable | Works on any underlying filesystem (ext4, xfs, nfs, etc.) |
 
 ## Architecture
 
-BranchFS is a FUSE-based filesystem that requires no root privileges. It implements file-level copy-on-write: when a file is modified on a branch, the entire file is lazily copied to the branch's delta storage, while unmodified files are resolved by walking up the branch chain to the base directory. Deletions are tracked via tombstone markers. On commit, all changes from the branch chain are applied atomically to the base directory; on abort, the branch's delta storage is simply discarded.
+BranchFS is a FUSE-based filesystem that requires no root privileges. It implements file-level copy-on-write: when a file is modified on a branch, the entire file is lazily copied to the branch's delta storage, while unmodified files are resolved by walking up the branch chain to the base directory. Deletions are tracked via tombstone markers. On commit, changes from a leaf branch are merged into its immediate parent (or applied to the base directory if the parent is main); on abort, the leaf branch's delta storage is simply discarded.
 
 ### Why not overlayfs?
 
@@ -106,8 +106,12 @@ branchfs create level2 /mnt/workspace -p level1 # auto-switches to level2
 # Now on level2, work in it
 echo "deep change" > /mnt/workspace/file.txt
 
-# Commit from level2 applies: level2 + level1 → base, switches to main
+# Commit from level2 merges into level1, switches to level1
 branchfs commit /mnt/workspace
+
+# Now on level1, commit to base
+branchfs commit /mnt/workspace
+# Changes from both level2 and level1 are now in base, switches to main
 ```
 
 ### @branch Virtual Paths
@@ -176,22 +180,24 @@ All mounts share a single branch namespace managed by the daemon. Branches creat
 
 ### Commit
 
-Committing a branch applies the entire chain of changes to the base filesystem:
+Committing merges a **leaf branch** into its immediate parent:
 
-1. Changes are collected from the current branch up through its ancestors
-2. Deletions are applied first, then file modifications
-3. Epoch increments, invalidating all branches across all mounts
-4. **Mount automatically switches to main branch** (stays mounted)
-5. Memory-mapped regions trigger `SIGBUS` on next access
+1. Only leaf branches can be committed, attempting to commit a branch with children returns an error
+2. If the parent is **main**: tombstone deletions are applied to the base filesystem, then delta files are copied to base
+3. If the parent is **another branch**: child's delta files are merged into the parent's delta directory, and tombstones are merged (child tombstones shadow parent deltas, child deltas un-tombstone parent tombstones)
+4. The committed branch is removed; epoch increments
+5. **Mount automatically switches to the parent branch** (stays mounted)
+6. Memory-mapped regions trigger `SIGBUS` on next access
 
 ### Abort
 
-Aborting discards the entire branch chain without affecting the base:
+Aborting discards only the **leaf branch** without affecting the parent:
 
-1. The entire branch chain (current branch up to main) is discarded
-2. Other branches continue operating normally
-3. **Mount automatically switches to main branch** (stays mounted)
-4. Memory-mapped regions in aborted branches trigger `SIGBUS`
+1. Only leaf branches can be aborted, attempting to abort a branch with children returns an error
+2. The leaf branch's delta storage is discarded
+3. Other branches (including the parent) continue operating normally
+4. **Mount automatically switches to the parent branch** (stays mounted)
+5. Memory-mapped regions in the aborted branch trigger `SIGBUS`
 
 ### Unmount
 

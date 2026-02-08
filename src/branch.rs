@@ -12,9 +12,6 @@ use parking_lot::{Mutex, RwLock};
 use crate::error::{BranchError, Result};
 use crate::inode::ROOT_INO;
 
-/// Type alias for collected changes: (deletions, file modifications)
-type CollectedChanges = (HashSet<String>, Vec<(String, PathBuf)>);
-
 pub struct Branch {
     pub name: String,
     pub parent: Option<String>,
@@ -77,6 +74,18 @@ impl Branch {
 
     pub fn get_tombstones(&self) -> HashSet<String> {
         self.tombstones.read().clone()
+    }
+
+    /// Replace the in-memory tombstone set and rewrite the tombstones file.
+    pub fn set_tombstones(&self, new_tombstones: HashSet<String>) -> Result<()> {
+        let mut tombstones = self.tombstones.write();
+        *tombstones = new_tombstones;
+        // Rewrite the tombstones file
+        let mut file = File::create(&self.tombstones_file)?;
+        for t in tombstones.iter() {
+            writeln!(file, "{}", t)?;
+        }
+        Ok(())
     }
 
     pub fn delta_path(&self, rel_path: &str) -> PathBuf {
@@ -368,7 +377,14 @@ impl BranchManager {
         }
     }
 
-    pub fn commit(&self, branch_name: &str) -> Result<()> {
+    /// Returns true if no other branch has `parent == name`.
+    fn is_leaf(name: &str, branches: &std::collections::HashMap<String, Branch>) -> bool {
+        !branches.values().any(|b| b.parent.as_deref() == Some(name))
+    }
+
+    /// Commit a leaf branch into its immediate parent.
+    /// Returns the parent branch name on success.
+    pub fn commit(&self, branch_name: &str) -> Result<String> {
         let start = Instant::now();
         if branch_name == "main" {
             return Err(BranchError::CannotOperateOnMain);
@@ -376,114 +392,163 @@ impl BranchManager {
 
         let mut branches = self.branches.write();
 
-        let chain = self.get_branch_chain(branch_name, &branches)?;
-        let (deletions, files) = self.collect_changes(&chain, &branches)?;
-        let num_deletions = deletions.len();
-        let num_files = files.len();
-        let total_bytes: u64 = files
-            .iter()
-            .filter_map(|(_, p)| p.metadata().ok())
-            .map(|m| m.len())
-            .sum();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
 
-        for path in &deletions {
-            let full_path = self.base_path.join(path.trim_start_matches('/'));
-            if full_path.exists() {
-                if full_path.is_dir() {
-                    fs::remove_dir_all(&full_path)?;
-                } else {
-                    fs::remove_file(&full_path)?;
+        if !Self::is_leaf(branch_name, &branches) {
+            return Err(BranchError::NotALeaf(branch_name.to_string()));
+        }
+
+        let parent_name = branch
+            .parent
+            .clone()
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
+
+        let child_tombstones = branch.get_tombstones();
+        let child_files_dir = branch.files_dir.clone();
+
+        if parent_name == "main" {
+            // Direct child of main: apply to base filesystem
+            // Apply tombstones as deletions
+            for path in &child_tombstones {
+                let full_path = self.base_path.join(path.trim_start_matches('/'));
+                if full_path.exists() {
+                    if full_path.is_dir() {
+                        fs::remove_dir_all(&full_path)?;
+                    } else {
+                        fs::remove_file(&full_path)?;
+                    }
                 }
             }
-        }
 
-        for (rel_path, src_path) in &files {
-            let dest = self.base_path.join(rel_path.trim_start_matches('/'));
-            if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
+            // Copy delta files to base
+            let mut num_files = 0u64;
+            let mut total_bytes = 0u64;
+            self.walk_files(&child_files_dir, "", &mut |rel_path, src_path| {
+                let dest = self.base_path.join(rel_path.trim_start_matches('/'));
+                if let Some(parent_dir) = dest.parent() {
+                    let _ = fs::create_dir_all(parent_dir);
+                }
+                if let Ok(meta) = src_path.metadata() {
+                    total_bytes += meta.len();
+                }
+                let _ = fs::copy(src_path, &dest);
+                num_files += 1;
+            })?;
+
+            // Remove branch
+            branches.remove(branch_name);
+            let branch_dir = self.storage_path.join("branches").join(branch_name);
+            if branch_dir.exists() {
+                fs::remove_dir_all(&branch_dir)?;
             }
-            fs::copy(src_path, &dest)?;
+
+            self.epoch.fetch_add(1, Ordering::SeqCst);
+
+            drop(branches);
+            self.invalidate_all_mounts();
+
+            let elapsed = start.elapsed();
+            log::debug!(
+                "[BENCH] commit '{}' to base: {:?} ({} us), {} deletions, {} files, {} bytes",
+                branch_name,
+                elapsed,
+                elapsed.as_micros(),
+                child_tombstones.len(),
+                num_files,
+                total_bytes
+            );
+        } else {
+            // Nested branch: merge delta into parent's delta
+            let parent = branches
+                .get(&parent_name)
+                .ok_or_else(|| BranchError::NotFound(parent_name.to_string()))?;
+
+            let parent_files_dir = parent.files_dir.clone();
+            let mut parent_tombstones = parent.get_tombstones();
+
+            // Step 1: For each child tombstone, remove matching file from parent delta
+            // and add tombstone to parent
+            for tombstone in &child_tombstones {
+                let parent_delta = parent_files_dir.join(tombstone.trim_start_matches('/'));
+                if parent_delta.exists() {
+                    if parent_delta.is_dir() {
+                        let _ = fs::remove_dir_all(&parent_delta);
+                    } else {
+                        let _ = fs::remove_file(&parent_delta);
+                    }
+                }
+                parent_tombstones.insert(tombstone.clone());
+            }
+
+            // Step 2: Copy child's delta files into parent's delta directory
+            let mut copied_paths = Vec::new();
+            self.walk_files(&child_files_dir, "", &mut |rel_path, src_path| {
+                let dest = parent_files_dir.join(rel_path.trim_start_matches('/'));
+                if let Some(parent_dir) = dest.parent() {
+                    let _ = fs::create_dir_all(parent_dir);
+                }
+                let _ = fs::copy(src_path, &dest);
+                copied_paths.push(rel_path.to_string());
+            })?;
+
+            // Step 3: For each copied delta file, remove that path from parent's tombstones
+            for path in &copied_paths {
+                parent_tombstones.remove(path);
+            }
+
+            // Write updated tombstones to parent
+            parent.set_tombstones(parent_tombstones)?;
+
+            // Remove child branch
+            branches.remove(branch_name);
+            let branch_dir = self.storage_path.join("branches").join(branch_name);
+            if branch_dir.exists() {
+                fs::remove_dir_all(&branch_dir)?;
+            }
+
+            self.epoch.fetch_add(1, Ordering::SeqCst);
+
+            let affected = vec![branch_name.to_string(), parent_name.clone()];
+            drop(branches);
+            self.invalidate_branches(&affected);
+
+            let elapsed = start.elapsed();
+            log::debug!(
+                "[BENCH] commit '{}' into parent '{}': {:?} ({} us)",
+                branch_name,
+                parent_name,
+                elapsed,
+                elapsed.as_micros(),
+            );
         }
 
-        branches.clear();
-        let main_branch = Branch::new("main", None, &self.storage_path)?;
-        branches.insert("main".to_string(), main_branch);
-
-        self.epoch.fetch_add(1, Ordering::SeqCst);
-
-        // Invalidate kernel cache for all mounts (epoch changed, everything is stale)
-        // Must be done after releasing the branches lock to avoid deadlock
-        drop(branches);
-        self.invalidate_all_mounts();
-
-        let elapsed = start.elapsed();
-        log::debug!(
-            "[BENCH] commit '{}': {:?} ({} us), {} deletions, {} files, {} bytes",
-            branch_name,
-            elapsed,
-            elapsed.as_micros(),
-            num_deletions,
-            num_files,
-            total_bytes
-        );
-
-        Ok(())
+        Ok(parent_name)
     }
 
-    pub fn abort(&self, branch_name: &str) -> Result<()> {
+    /// Abort a leaf branch, discarding only that branch.
+    /// Returns the parent branch name on success.
+    pub fn abort(&self, branch_name: &str) -> Result<String> {
         let start = Instant::now();
         if branch_name == "main" {
             return Err(BranchError::CannotOperateOnMain);
         }
 
         let mut branches = self.branches.write();
-        let chain = self.get_branch_chain(branch_name, &branches)?;
 
-        // Collect branch names before modifying (for cache invalidation)
-        let aborted_branches: Vec<String> =
-            chain.iter().filter(|n| *n != "main").cloned().collect();
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
 
-        for name in &chain {
-            if name != "main" {
-                branches.remove(name);
-                let branch_dir = self.storage_path.join("branches").join(name);
-                if branch_dir.exists() {
-                    fs::remove_dir_all(&branch_dir)?;
-                }
-            }
+        if !Self::is_leaf(branch_name, &branches) {
+            return Err(BranchError::NotALeaf(branch_name.to_string()));
         }
 
-        // Note: abort does NOT increment epoch - only the aborted branch chain
-        // becomes invalid, siblings remain valid.
-
-        // Invalidate kernel cache for aborted branches only
-        // Must be done after releasing the branches lock
-        drop(branches);
-        self.invalidate_branches(&aborted_branches);
-
-        let elapsed = start.elapsed();
-        log::debug!(
-            "[BENCH] abort '{}': {:?} ({} us)",
-            branch_name,
-            elapsed,
-            elapsed.as_micros()
-        );
-
-        Ok(())
-    }
-
-    pub fn abort_single(&self, branch_name: &str) -> Result<()> {
-        if branch_name == "main" {
-            // Nothing to abort for main
-            return Ok(());
-        }
-
-        let mut branches = self.branches.write();
-
-        if !branches.contains_key(branch_name) {
-            // Branch doesn't exist, nothing to do
-            return Ok(());
-        }
+        let parent_name = branch
+            .parent
+            .clone()
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
 
         // Remove only this branch
         branches.remove(branch_name);
@@ -496,59 +561,15 @@ impl BranchManager {
         drop(branches);
         self.invalidate_branches(&[branch_name.to_string()]);
 
-        Ok(())
-    }
+        let elapsed = start.elapsed();
+        log::debug!(
+            "[BENCH] abort '{}': {:?} ({} us)",
+            branch_name,
+            elapsed,
+            elapsed.as_micros()
+        );
 
-    fn get_branch_chain(
-        &self,
-        start: &str,
-        branches: &std::collections::HashMap<String, Branch>,
-    ) -> Result<Vec<String>> {
-        let mut chain = Vec::new();
-        let mut current = start;
-
-        loop {
-            chain.push(current.to_string());
-            let branch = branches
-                .get(current)
-                .ok_or_else(|| BranchError::NotFound(current.to_string()))?;
-
-            match &branch.parent {
-                Some(parent) => current = parent,
-                None => break,
-            }
-        }
-
-        Ok(chain)
-    }
-
-    fn collect_changes(
-        &self,
-        chain: &[String],
-        branches: &std::collections::HashMap<String, Branch>,
-    ) -> Result<CollectedChanges> {
-        let mut deletions = HashSet::new();
-        let mut files = Vec::new();
-        let mut seen_files = HashSet::new();
-
-        for name in chain {
-            let branch = branches.get(name).unwrap();
-
-            for path in branch.get_tombstones() {
-                deletions.insert(path);
-            }
-
-            if branch.files_dir.exists() {
-                self.walk_files(&branch.files_dir, "", &mut |rel_path, full_path| {
-                    if !seen_files.contains(rel_path) && !deletions.contains(rel_path) {
-                        seen_files.insert(rel_path.to_string());
-                        files.push((rel_path.to_string(), full_path.to_path_buf()));
-                    }
-                })?;
-            }
-        }
-
-        Ok((deletions, files))
+        Ok(parent_name)
     }
 
     fn walk_files<F>(&self, dir: &Path, prefix: &str, f: &mut F) -> Result<()>
