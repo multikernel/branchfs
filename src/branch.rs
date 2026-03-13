@@ -103,6 +103,9 @@ pub struct Branch {
     pub files_dir: PathBuf,
     pub tombstones_file: PathBuf,
     tombstones: RwLock<HashSet<String>>,
+    /// Number of stale (removed-from-memory-but-still-on-disk) tombstone entries.
+    /// When this exceeds the live set size, we compact the file.
+    tombstone_stale: AtomicU64,
     /// How many children have been committed (merged) into this branch.
     pub commit_count: AtomicU64,
     /// Parent's commit_count at the time this branch was forked.
@@ -133,6 +136,7 @@ impl Branch {
             files_dir,
             tombstones_file,
             tombstones: RwLock::new(tombstones),
+            tombstone_stale: AtomicU64::new(0),
             commit_count: AtomicU64::new(0),
             parent_version_at_fork,
         })
@@ -165,7 +169,26 @@ impl Branch {
     }
 
     pub fn remove_tombstone(&self, path: &str) {
-        self.tombstones.write().remove(path);
+        let mut tombstones = self.tombstones.write();
+        if tombstones.remove(path) {
+            let stale = self.tombstone_stale.fetch_add(1, Ordering::Relaxed) + 1;
+            // Compact when stale entries exceed live set size (at least 16 to avoid
+            // thrashing on tiny sets).
+            if stale >= tombstones.len().max(16) as u64 {
+                if self.rewrite_tombstones(&tombstones).is_ok() {
+                    self.tombstone_stale.store(0, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    /// Rewrite the tombstones file from the in-memory set (caller holds write lock).
+    fn rewrite_tombstones(&self, tombstones: &HashSet<String>) -> Result<()> {
+        let mut file = File::create(&self.tombstones_file)?;
+        for t in tombstones {
+            writeln!(file, "{}", t)?;
+        }
+        Ok(())
     }
 
     pub fn get_tombstones(&self) -> HashSet<String> {
@@ -176,11 +199,8 @@ impl Branch {
     pub fn set_tombstones(&self, new_tombstones: HashSet<String>) -> Result<()> {
         let mut tombstones = self.tombstones.write();
         *tombstones = new_tombstones;
-        // Rewrite the tombstones file
-        let mut file = File::create(&self.tombstones_file)?;
-        for t in tombstones.iter() {
-            writeln!(file, "{}", t)?;
-        }
+        self.rewrite_tombstones(&tombstones)?;
+        self.tombstone_stale.store(0, Ordering::Relaxed);
         Ok(())
     }
 
