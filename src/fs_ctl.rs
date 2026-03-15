@@ -38,12 +38,14 @@ impl BranchFs {
     /// Only supports `switch:<branch_name>` — commit/abort go through
     /// per-branch ctl files (`/@<branch>/.branchfs_ctl`).
     pub(crate) fn handle_root_ctl_write(&mut self, data: &[u8], reply: ReplyWrite) {
-        let cmd = String::from_utf8_lossy(data).trim().to_string();
+        let cmd = String::from_utf8_lossy(data)
+            .trim_matches(|c: char| c.is_whitespace() || c == '\0')
+            .to_string();
         let cmd_lower = cmd.to_lowercase();
         log::info!("Root ctl command: '{}'", cmd);
 
-        if let Some(new_branch) = cmd_lower.strip_prefix("switch:") {
-            let new_branch = new_branch.trim();
+        if cmd_lower.starts_with("switch:") {
+            let new_branch = cmd[7..].trim();
             if new_branch.is_empty() {
                 log::warn!("Empty branch name in switch command");
                 reply.error(libc::EINVAL);
@@ -57,9 +59,38 @@ impl BranchFs {
             self.switch_to_branch(new_branch);
             log::info!("Switched to branch '{}'", new_branch);
             reply.written(data.len() as u32);
+        } else if cmd_lower == "create" || cmd_lower.starts_with("create:") {
+            let name = if cmd_lower.starts_with("create:") {
+                cmd[7..].trim().to_string()
+            } else {
+                format!("branch-{}", uuid::Uuid::new_v4())
+            };
+            if name.is_empty() {
+                reply.error(libc::EINVAL);
+                return;
+            }
+            log::info!("Root ctl: CREATE branch '{}' from current", name);
+            let parent = self.get_branch_name();
+            match self.manager.create_branch(&name, &parent) {
+                Ok(()) => {
+                    self.current_epoch
+                        .store(self.manager.get_epoch(), Ordering::SeqCst);
+                    reply.written(data.len() as u32);
+                }
+                Err(e) => {
+                    log::error!("create branch failed: {}", e);
+                    reply.error(libc::EIO);
+                }
+            }
+        } else if cmd_lower == "commit" {
+            let branch = self.get_branch_name();
+            self.finalize_branch_op(&branch, self.manager.commit(&branch), "commit", data.len() as u32, reply);
+        } else if cmd_lower == "abort" {
+            let branch = self.get_branch_name();
+            self.finalize_branch_op(&branch, self.manager.abort(&branch), "abort", data.len() as u32, reply);
         } else {
             log::warn!(
-                "Unknown root ctl command: '{}' (use /@branch/.branchfs_ctl for commit/abort)",
+                "Unknown root ctl command: '{}' (supported: create, commit, abort, switch:name)",
                 cmd
             );
             reply.error(libc::EINVAL);
@@ -68,20 +99,45 @@ impl BranchFs {
 
     /// Handle a write to a per-branch ctl file.
     pub(crate) fn handle_branch_ctl_write(&mut self, branch: &str, data: &[u8], reply: ReplyWrite) {
-        let cmd = String::from_utf8_lossy(data).trim().to_string();
+        let cmd = String::from_utf8_lossy(data)
+            .trim_matches(|c: char| c.is_whitespace() || c == '\0')
+            .to_string();
         let cmd_lower = cmd.to_lowercase();
         log::info!("Branch ctl command: '{}' for branch '{}'", cmd, branch);
 
-        let result = match cmd_lower.as_str() {
-            "commit" => self.manager.commit(branch),
-            "abort" => self.manager.abort(branch),
-            _ => {
-                log::warn!("Unknown branch ctl command: {}", cmd);
+        if cmd_lower == "commit" {
+            self.finalize_branch_op(branch, self.manager.commit(branch), "commit", data.len() as u32, reply);
+        } else if cmd_lower == "abort" {
+            self.finalize_branch_op(branch, self.manager.abort(branch), "abort", data.len() as u32, reply);
+        } else if cmd_lower == "create" || cmd_lower.starts_with("create:") {
+            let name = if cmd_lower.starts_with("create:") {
+                cmd[7..].trim().to_string()
+            } else {
+                format!("branch-{}", uuid::Uuid::new_v4())
+            };
+            if name.is_empty() {
                 reply.error(libc::EINVAL);
                 return;
             }
-        };
+            log::info!("Branch ctl: CREATE branch '{}' from '{}'", name, branch);
+            match self.manager.create_branch(&name, branch) {
+                Ok(()) => {
+                    self.current_epoch
+                        .store(self.manager.get_epoch(), Ordering::SeqCst);
+                    reply.written(data.len() as u32);
+                }
+                Err(e) => {
+                    log::error!("create branch failed: {}", e);
+                    reply.error(libc::EIO);
+                }
+            }
+        } else {
+            log::warn!("Unknown branch ctl command: {}", cmd);
+            reply.error(libc::EINVAL);
+        }
+    }
 
+    fn finalize_branch_op(&mut self, branch: &str, result: Result<String, BranchError>, op: &str, written_len: u32, reply: ReplyWrite) {
         match result {
             Ok(parent) => {
                 // Clear inodes for the affected branch prefix and update epoch
@@ -94,22 +150,22 @@ impl BranchFs {
                     self.manager.switch_mount_branch(&self.mountpoint, &parent);
                     log::info!(
                         "Branch ctl {} succeeded for '{}', switched to '{}'",
-                        cmd_lower,
+                        op,
                         branch,
                         parent
                     );
                 } else {
                     log::info!(
                         "Branch ctl {} succeeded for '{}' (mount stays on '{}')",
-                        cmd_lower,
+                        op,
                         branch,
                         current
                     );
                 }
-                reply.written(data.len() as u32)
+                reply.written(written_len)
             }
             Err(BranchError::Conflict(_)) => {
-                log::warn!("Branch ctl {} conflict for '{}'", cmd_lower, branch);
+                log::warn!("Branch ctl {} conflict for '{}'", op, branch);
                 reply.error(libc::ESTALE);
             }
             Err(e) => {

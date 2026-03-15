@@ -9,7 +9,11 @@ keywords = ["fuse", "filesystem", "branching", "copy-on-write"]
 categories = ["filesystem"]
 
 [dependencies]
-fuser = { version = "0.16", features = ["abi-7-40"] }
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "0.16", features = ["abi-7-40", "libfuse"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+fuser = { version = "0.16", features = ["abi-7-31", "libfuse"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

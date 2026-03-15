@@ -36,8 +36,8 @@ FUSE adds userspace-kernel context switches per operation, which is slower than 
 
 ## Prerequisites
 
-- Linux with FUSE support
-- libfuse3 development libraries
+- Linux with FUSE support or macOS with macFUSE
+- libfuse3 development libraries (Linux) or macFUSE (macOS)
 - Rust toolchain (1.70 or later)
 
 ### Installing Dependencies
@@ -56,6 +56,24 @@ sudo dnf install fuse3-devel pkg-config
 ```bash
 sudo pacman -S fuse3 pkg-config
 ```
+
+**macOS:**
+```bash
+brew install macfuse pkg-config
+```
+
+### macOS Support
+
+BranchFS supports macOS via **macFUSE**. 
+
+1. **Install macFUSE**: `brew install macfuse pkg-config`.
+2. **System Extension**: You must approve the `macFUSE` system extension in System Settings. On Apple Silicon Macs, you may need to enable third-party kernel extensions in Recovery Mode.
+3. **Control Interface**: Since `ioctl` support can be inconsistent on macOS, BranchFS provides a reliable write-based interface. You can send commands to `.branchfs_ctl` via direct writes:
+   - `echo "create:name" > .branchfs_ctl`
+   - `echo "commit" > .branchfs_ctl`
+   - `echo "abort" > .branchfs_ctl`
+4. **FUSE ABI**: On macOS, BranchFS targets FUSE ABI 7.31 for maximum compatibility and to resolve path resolution issues.
+5. **Advanced Features**: Linux-specific features like FUSE passthrough and `RENAME_EXCHANGE` are currently disabled on macOS.
 
 ## Building
 
