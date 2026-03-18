@@ -11,8 +11,6 @@ use fuser::{
     FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
     ReplyIoctl, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow,
 };
-#[cfg(target_os = "linux")]
-use fuser::BackingId;
 use parking_lot::RwLock;
 
 use crate::branch::BranchManager;
@@ -20,26 +18,13 @@ use crate::error::BranchError;
 use crate::fs_path::{classify_path, PathContext};
 use crate::inode::{InodeManager, ROOT_INO};
 use crate::storage;
+use crate::platform::{FS_IOC_BRANCH_ABORT, FS_IOC_BRANCH_COMMIT, FS_IOC_BRANCH_CREATE};
 
 // Zero TTL forces the kernel to always revalidate with FUSE, ensuring consistent
 // behavior after branch switches. This is important for speculative execution
 // where branches can change at any time.
 pub(crate) const TTL: Duration = Duration::from_secs(0);
 pub(crate) const BLOCK_SIZE: u32 = 512;
-
-#[cfg(target_os = "linux")]
-pub const FS_IOC_BRANCH_CREATE: u32 = 0x8080_6200; // _IOR('b', 0, [u8; 128])
-#[cfg(target_os = "linux")]
-pub const FS_IOC_BRANCH_COMMIT: u32 = 0x0000_6201; // _IO ('b', 1)
-#[cfg(target_os = "linux")]
-pub const FS_IOC_BRANCH_ABORT: u32 = 0x0000_6202; // _IO ('b', 2)
-
-#[cfg(not(target_os = "linux"))]
-pub const FS_IOC_BRANCH_CREATE: u32 = 0x4080_6200; // _IOR('b', 0, [u8; 128])
-#[cfg(not(target_os = "linux"))]
-pub const FS_IOC_BRANCH_COMMIT: u32 = 0x2000_6201; // _IO ('b', 1)
-#[cfg(not(target_os = "linux"))]
-pub const FS_IOC_BRANCH_ABORT: u32 = 0x2000_6202; // _IO ('b', 2)
 
 pub(crate) const CTL_FILE: &str = ".branchfs_ctl";
 pub(crate) const CTL_INO: u64 = u64::MAX - 1;
@@ -144,12 +129,8 @@ pub struct BranchFs {
     write_cache: WriteFileCache,
     /// Whether FUSE passthrough mode is enabled (--passthrough flag).
     passthrough_enabled: bool,
-    /// Monotonically increasing file handle counter for passthrough opens.
-    #[cfg(target_os = "linux")]
-    next_fh: AtomicU64,
-    /// BackingId objects kept alive until release() — one per passthrough open().
-    #[cfg(target_os = "linux")]
-    backing_ids: HashMap<u64, BackingId>,
+    /// FUSE passthrough state (fh counter, backing_ids)
+    passthrough_state: crate::platform::PassthroughState,
 }
 
 impl BranchFs {
@@ -169,10 +150,7 @@ impl BranchFs {
             open_cache: OpenFileCache::new(),
             write_cache: WriteFileCache::new(),
             passthrough_enabled: passthrough,
-            #[cfg(target_os = "linux")]
-            next_fh: AtomicU64::new(1),
-            #[cfg(target_os = "linux")]
-            backing_ids: HashMap::new(),
+            passthrough_state: crate::platform::PassthroughState::new(),
         }
     }
 
@@ -242,10 +220,8 @@ impl BranchFs {
     }
 
     /// Attempt to open a file with FUSE passthrough. Falls back to non-passthrough on failure.
-    #[cfg(target_os = "linux")]
     fn try_open_passthrough(
         &mut self,
-        _ino: u64,
         flags: i32,
         branch: &str,
         rel_path: &str,
@@ -254,13 +230,10 @@ impl BranchFs {
     ) {
         let is_writable = (flags & libc::O_ACCMODE) != libc::O_RDONLY;
 
-        // For writable opens, do eager COW — the kernel will write directly to
-        // the backing file, bypassing our write() callback.
         let backing_path = if is_writable {
             match self.ensure_cow_for_branch(branch, rel_path) {
                 Ok(p) => p,
                 Err(_) => {
-                    // Fallback to non-passthrough
                     reply.opened(0, 0);
                     return;
                 }
@@ -269,7 +242,6 @@ impl BranchFs {
             resolved.to_path_buf()
         };
 
-        // Open the backing file
         let open_result = if is_writable {
             std::fs::OpenOptions::new()
                 .read(true)
@@ -278,26 +250,11 @@ impl BranchFs {
         } else {
             File::open(&backing_path)
         };
-        let file = match open_result {
-            Ok(f) => f,
-            Err(_) => {
-                reply.opened(0, 0);
-                return;
-            }
-        };
-
-        // Register the fd with the kernel
-        let backing_id = match reply.open_backing(&file) {
-            Ok(id) => id,
-            Err(_) => {
-                reply.opened(0, 0);
-                return;
-            }
-        };
-
-        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        reply.opened_passthrough(fh, 0, &backing_id);
-        self.backing_ids.insert(fh, backing_id);
+        
+        match open_result {
+            Ok(f) => crate::platform::try_open_passthrough(&mut self.passthrough_state, f, reply),
+            Err(_) => reply.opened(0, 0),
+        }
     }
 
     /// Classify an inode number. Returns None for root and CTL_INO (handled separately).
@@ -318,7 +275,7 @@ impl BranchFs {
 }
 
 impl Filesystem for BranchFs {
-    fn init(&mut self, req: &Request, _config: &mut fuser::KernelConfig) -> Result<(), libc::c_int> {
+    fn init(&mut self, req: &Request, config: &mut fuser::KernelConfig) -> Result<(), libc::c_int> {
         // The init request may come from the kernel (uid=0) rather than the
         // mounting user, so only override the process-derived defaults when
         // the request carries a real (non-root) uid.
@@ -328,29 +285,7 @@ impl Filesystem for BranchFs {
         }
 
         if self.passthrough_enabled {
-            #[cfg(target_os = "linux")]
-            {
-                if let Err(e) = config.add_capabilities(fuser::consts::FUSE_PASSTHROUGH) {
-                    log::warn!(
-                        "Kernel does not support FUSE_PASSTHROUGH (unsupported bits: {:#x}), disabling",
-                        e
-                    );
-                    self.passthrough_enabled = false;
-                } else if let Err(e) = config.set_max_stack_depth(2) {
-                    log::warn!(
-                        "Failed to set max_stack_depth (max: {}), disabling passthrough",
-                        e
-                    );
-                    self.passthrough_enabled = false;
-                } else {
-                    log::info!("FUSE passthrough enabled");
-                }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                log::warn!("FUSE passthrough is only supported on Linux, disabling");
-                self.passthrough_enabled = false;
-            }
+            crate::platform::setup_capabilities(config, &mut self.passthrough_enabled);
         }
 
         Ok(())
@@ -1192,9 +1127,8 @@ impl Filesystem for BranchFs {
         _flags: u32,
         reply: ReplyEmpty,
     ) {
-        #[cfg(target_os = "linux")]
-        if flags & libc::RENAME_EXCHANGE != 0 {
-            reply.error(libc::EINVAL);
+        if let Err(e) = crate::platform::check_rename_flags(_flags) {
+            reply.error(e);
             return;
         }
 
@@ -1280,8 +1214,7 @@ impl Filesystem for BranchFs {
         }
 
         // RENAME_NOREPLACE
-        #[cfg(target_os = "linux")]
-        if flags & libc::RENAME_NOREPLACE != 0
+        if crate::platform::check_rename_noreplace(_flags)
             && self.resolve_for_branch(&branch, &dst_rel).is_some()
         {
             reply.error(libc::EEXIST);
@@ -1399,14 +1332,11 @@ impl Filesystem for BranchFs {
                 };
                 self.manager.register_opened_inode(&branch, ino);
 
-                #[cfg(target_os = "linux")]
                 if self.passthrough_enabled {
-                    self.try_open_passthrough(ino, _flags, &branch, &rel_path, &_resolved, reply);
+                    self.try_open_passthrough(_flags, &branch, &rel_path, &_resolved, reply);
                 } else {
                     reply.opened(0, 0);
                 }
-                #[cfg(not(target_os = "linux"))]
-                reply.opened(0, 0);
             }
             _ => {
                 // Root path
@@ -1424,14 +1354,11 @@ impl Filesystem for BranchFs {
                 let branch_name = self.get_branch_name();
                 self.manager.register_opened_inode(&branch_name, ino);
 
-                #[cfg(target_os = "linux")]
                 if self.passthrough_enabled {
-                    self.try_open_passthrough(ino, _flags, &branch_name, &path, &_resolved, reply);
+                    self.try_open_passthrough(_flags, &branch_name, &path, &_resolved, reply);
                 } else {
                     reply.opened(0, 0);
                 }
-                #[cfg(not(target_os = "linux"))]
-                reply.opened(0, 0);
             }
         }
     }
@@ -1447,8 +1374,7 @@ impl Filesystem for BranchFs {
         reply: ReplyEmpty,
     ) {
         if fh != 0 {
-            #[cfg(target_os = "linux")]
-            self.backing_ids.remove(&fh);
+            crate::platform::release_passthrough(&mut self.passthrough_state, fh);
         }
         reply.ok();
     }
@@ -1830,10 +1756,7 @@ impl Filesystem for BranchFs {
     }
 
     fn access(&mut self, _req: &Request, _ino: u64, _mask: i32, reply: ReplyEmpty) {
-        // macOS macFUSE sometimes requires access() to be implemented when DefaultPermissions
-        // is not used, otherwise it may return EPERM. We trust the open() and other calls
-        // to handle specific permissions.
-        reply.ok();
+        crate::platform::handle_access(reply);
     }
 
     fn symlink(

@@ -150,13 +150,7 @@ impl Daemon {
         let mut options = vec![
             MountOption::FSName("branchfs".to_string()),
         ];
-        #[cfg(target_os = "macos")]
-        {
-            options.push(MountOption::CUSTOM("noappledouble".to_string()));
-            options.push(MountOption::CUSTOM("volname=branchfs".to_string()));
-            options.push(MountOption::CUSTOM("defer_permissions".to_string()));
-            options.push(MountOption::CUSTOM("local".to_string()));
-        }
+        options.extend(crate::platform::get_mount_options());
 
         log::info!(
             "Spawning mount for branch '{}' at {:?}",
