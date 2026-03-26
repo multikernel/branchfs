@@ -9,7 +9,7 @@ pub const FS_IOC_BRANCH_COMMIT: u32 = 0x0000_6201; // _IO ('b', 1)
 pub const FS_IOC_BRANCH_ABORT: u32 = 0x0000_6202; // _IO ('b', 2)
 
 pub fn get_mount_options() -> Vec<MountOption> {
-    vec![]
+    vec![MountOption::DefaultPermissions]
 }
 
 pub fn setup_capabilities(config: &mut KernelConfig, passthrough_enabled: &mut bool) {

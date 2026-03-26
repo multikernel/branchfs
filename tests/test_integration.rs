@@ -11,7 +11,6 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-#[cfg(not(target_os = "macos"))]
 use branchfs::{FS_IOC_BRANCH_ABORT, FS_IOC_BRANCH_COMMIT, FS_IOC_BRANCH_CREATE};
 
 /// Helper: CREATE a branch. Returns the new branch name.
@@ -31,11 +30,8 @@ unsafe fn ioctl_create(fd: i32) -> Result<String, i32> {
     #[cfg(not(target_os = "macos"))]
     {
         let mut buf = [0u8; 128];
-        let ret = libc::ioctl(fd, FS_IOC_BRANCH_CREATE as libc::c_ulong, buf.as_mut_ptr());
+        let ret = libc::ioctl(fd, branchfs::platform::FS_IOC_BRANCH_CREATE as libc::c_ulong, buf.as_mut_ptr());
         if ret < 0 {
-            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "watchos", target_os = "tvos", target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd", target_os = "netbsd"))]
-            return Err(unsafe { *libc::__error() });
-            #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "watchos", target_os = "tvos", target_os = "freebsd", target_os = "dragonfly", target_os = "openbsd", target_os = "netbsd")))]
             return Err(unsafe { *libc::__errno_location() });
         }
         let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
@@ -58,7 +54,7 @@ unsafe fn ioctl_commit(fd: i32) -> i32 {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        libc::ioctl(fd, FS_IOC_BRANCH_COMMIT as libc::c_ulong)
+        libc::ioctl(fd, branchfs::platform::FS_IOC_BRANCH_COMMIT as libc::c_ulong)
     }
 }
 
@@ -77,7 +73,7 @@ unsafe fn ioctl_abort(fd: i32) -> i32 {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        libc::ioctl(fd, FS_IOC_BRANCH_ABORT as libc::c_ulong)
+        libc::ioctl(fd, branchfs::platform::FS_IOC_BRANCH_ABORT as libc::c_ulong)
     }
 }
 
@@ -140,8 +136,8 @@ impl TestFixture {
                 self.storage.to_str().unwrap(),
                 self.mnt.to_str().unwrap(),
             ])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status()
             .expect("failed to run branchfs mount");
 
