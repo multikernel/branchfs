@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use branchfs::{FS_IOC_BRANCH_ABORT, FS_IOC_BRANCH_COMMIT, FS_IOC_BRANCH_CREATE};
+
 
 /// Helper: CREATE a branch. Returns the new branch name.
 unsafe fn ioctl_create(fd: i32) -> Result<String, i32> {
