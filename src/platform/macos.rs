@@ -34,7 +34,14 @@ pub fn check_rename_flags(_flags: u32) -> Result<(), i32> {
 }
 
 pub fn check_rename_noreplace(_flags: u32) -> bool {
-    false // macOS does not have RENAME_NOREPLACE
+    // RENAME_NOREPLACE is Linux-only, macOS ignores this flag
+    false
+}
+
+pub fn ctl_file_size(_ino: u64) -> u64 {
+    // We set size to 0 on macOS because if we report >0, the kernel performs
+    // a Read-Modify-Write cycle on writes to the control file.
+    0
 }
 
 pub struct PassthroughState {}

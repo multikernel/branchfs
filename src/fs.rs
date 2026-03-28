@@ -1549,7 +1549,6 @@ impl Filesystem for BranchFs {
         _out_size: u32,
         reply: ReplyIoctl,
     ) {
-        log::info!("ioctl: ino={}, cmd={:#x}", ino, cmd);
         // Resolve ino to the branch name this ctl fd refers to.
         let branch_name = if ino == CTL_INO {
             self.get_branch_name()

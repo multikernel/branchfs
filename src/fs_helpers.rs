@@ -124,10 +124,7 @@ impl BranchFs {
 
     /// Return a synthetic ctl-file FileAttr.
     pub(crate) fn ctl_file_attr(&self, ino: u64) -> FileAttr {
-        // We set size to 0 here because if we report >0, the macOS kernel performs
-        // a Read-Modify-Write cycle on writes to the control file. This intercepts
-        // and corrupts commands like "commit" or "abort".
-        let size = 0;
+        let size = crate::platform::ctl_file_size(ino);
         FileAttr {
             ino,
             size,

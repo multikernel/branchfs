@@ -47,6 +47,11 @@ pub fn check_rename_noreplace(flags: u32) -> bool {
     flags & libc::RENAME_NOREPLACE != 0
 }
 
+pub fn ctl_file_size(ino: u64) -> u64 {
+    // On Linux we report 256 for CTL_INO to ensure the kernel issues read() calls.
+    if ino == crate::inode::CTL_INO { 256 } else { 0 }
+}
+
 pub struct PassthroughState {
     pub next_fh: AtomicU64,
     pub backing_ids: HashMap<u64, BackingId>,

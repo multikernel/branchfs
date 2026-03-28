@@ -407,8 +407,8 @@ pub fn start_daemon_background(
         cmd.args(["--max-storage", &max.to_string()]);
     }
     cmd.stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
 
     // Wait for daemon to be ready
