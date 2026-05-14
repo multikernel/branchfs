@@ -1872,12 +1872,15 @@ impl Filesystem for BranchFs {
             let storage_path = &self.manager.storage_path;
             match nix::sys::statvfs::statvfs(storage_path) {
                 Ok(stat) => {
+                    // nix's statvfs returns u32 fields on macOS but u64 on Linux;
+                    // cast to the u64 that reply.statfs() expects on both platforms.
+                    #[allow(clippy::unnecessary_cast)]
                     reply.statfs(
-                        stat.blocks(),
-                        stat.blocks_free(),
-                        stat.blocks_available(),
-                        stat.files(),
-                        stat.files_free(),
+                        stat.blocks() as u64,
+                        stat.blocks_free() as u64,
+                        stat.blocks_available() as u64,
+                        stat.files() as u64,
+                        stat.files_free() as u64,
                         stat.block_size() as u32,
                         stat.name_max() as u32,
                         stat.fragment_size() as u32,
