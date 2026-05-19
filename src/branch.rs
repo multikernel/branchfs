@@ -101,6 +101,7 @@ pub struct Branch {
     pub name: String,
     pub parent: Option<String>,
     pub files_dir: PathBuf,
+    pub inherited_dir: PathBuf,
     pub tombstones_file: PathBuf,
     tombstones: RwLock<HashSet<String>>,
     /// Number of stale (removed-from-memory-but-still-on-disk) tombstone entries.
@@ -121,9 +122,11 @@ impl Branch {
     ) -> Result<Self> {
         let branch_dir = storage_path.join("branches").join(name);
         let files_dir = branch_dir.join("files");
+        let inherited_dir = branch_dir.join("inherited");
         let tombstones_file = branch_dir.join("tombstones");
 
         fs::create_dir_all(&files_dir)?;
+        fs::create_dir_all(&inherited_dir)?;
         if !tombstones_file.exists() {
             File::create(&tombstones_file)?;
         }
@@ -134,6 +137,7 @@ impl Branch {
             name: name.to_string(),
             parent: parent.map(|s| s.to_string()),
             files_dir,
+            inherited_dir,
             tombstones_file,
             tombstones: RwLock::new(tombstones),
             tombstone_stale: AtomicU64::new(0),
@@ -206,6 +210,10 @@ impl Branch {
 
     pub fn delta_path(&self, rel_path: &str) -> PathBuf {
         self.files_dir.join(rel_path.trim_start_matches('/'))
+    }
+
+    pub fn inherited_path(&self, rel_path: &str) -> PathBuf {
+        self.inherited_dir.join(rel_path.trim_start_matches('/'))
     }
 
     pub fn has_delta(&self, rel_path: &str) -> bool {
@@ -348,6 +356,10 @@ impl BranchManager {
         let parent_version = parent_branch.commit_count.load(Ordering::SeqCst);
 
         let branch = Branch::new(name, Some(parent), &self.storage_path, parent_version)?;
+        if let Err(e) = self.snapshot_visible_tree(&branches, parent, &branch.inherited_dir) {
+            let _ = fs::remove_dir_all(self.storage_path.join("branches").join(name));
+            return Err(e);
+        }
         branches.insert(name.to_string(), branch);
 
         let elapsed = start.elapsed();
@@ -510,34 +522,34 @@ impl BranchManager {
         }
     }
 
-    /// Collect all candidate file/directory names visible in a directory
-    /// by walking the full branch ancestor chain and base directory.
-    /// Used by readdir to enumerate all possible entries before filtering.
-    pub fn collect_dir_names(&self, branch_name: &str, rel_path: &str) -> Result<HashSet<String>> {
-        let branches = self.branches.read();
+    fn inherited_source_path(&self, branch: &Branch, rel_path: &str) -> PathBuf {
+        if branch.parent.is_some() {
+            branch.inherited_path(rel_path)
+        } else {
+            self.base_path.join(rel_path.trim_start_matches('/'))
+        }
+    }
+
+    fn collect_dir_names_locked(
+        &self,
+        branches: &HashMap<String, Branch>,
+        branch_name: &str,
+        rel_path: &str,
+    ) -> Result<HashSet<String>> {
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
         let mut names = HashSet::new();
 
-        let mut current = branch_name;
-        loop {
-            let branch = branches
-                .get(current)
-                .ok_or_else(|| BranchError::NotFound(current.to_string()))?;
-
-            let delta_dir = branch.files_dir.join(rel_path.trim_start_matches('/'));
-            if let Ok(dir) = fs::read_dir(&delta_dir) {
-                for entry in dir.flatten() {
-                    names.insert(entry.file_name().to_string_lossy().to_string());
-                }
-            }
-
-            match &branch.parent {
-                Some(parent) => current = parent,
-                None => break,
+        let delta_dir = branch.files_dir.join(rel_path.trim_start_matches('/'));
+        if let Ok(dir) = fs::read_dir(&delta_dir) {
+            for entry in dir.flatten() {
+                names.insert(entry.file_name().to_string_lossy().to_string());
             }
         }
 
-        let base_dir = self.base_path.join(rel_path.trim_start_matches('/'));
-        if let Ok(dir) = fs::read_dir(&base_dir) {
+        let inherited_dir = self.inherited_source_path(branch, rel_path);
+        if let Ok(dir) = fs::read_dir(&inherited_dir) {
             for entry in dir.flatten() {
                 names.insert(entry.file_name().to_string_lossy().to_string());
             }
@@ -546,35 +558,95 @@ impl BranchManager {
         Ok(names)
     }
 
-    pub fn resolve_path(&self, branch_name: &str, rel_path: &str) -> Result<Option<PathBuf>> {
-        let branches = self.branches.read();
+    fn resolve_path_locked(
+        &self,
+        branches: &HashMap<String, Branch>,
+        branch_name: &str,
+        rel_path: &str,
+    ) -> Result<Option<PathBuf>> {
+        let branch = branches
+            .get(branch_name)
+            .ok_or_else(|| BranchError::NotFound(branch_name.to_string()))?;
 
-        let mut current = branch_name;
-        loop {
-            let branch = branches
-                .get(current)
-                .ok_or_else(|| BranchError::NotFound(current.to_string()))?;
-
-            if branch.is_deleted(rel_path) {
-                return Ok(None);
-            }
-
-            if branch.has_delta(rel_path) {
-                return Ok(Some(branch.delta_path(rel_path)));
-            }
-
-            match &branch.parent {
-                Some(parent) => current = parent,
-                None => break,
-            }
+        if branch.is_deleted(rel_path) {
+            return Ok(None);
         }
 
-        let base = self.base_path.join(rel_path.trim_start_matches('/'));
-        if base.symlink_metadata().is_ok() {
-            Ok(Some(base))
+        if branch.has_delta(rel_path) {
+            return Ok(Some(branch.delta_path(rel_path)));
+        }
+
+        let inherited = self.inherited_source_path(branch, rel_path);
+        if inherited.symlink_metadata().is_ok() {
+            Ok(Some(inherited))
         } else {
             Ok(None)
         }
+    }
+
+    fn snapshot_visible_tree(
+        &self,
+        branches: &HashMap<String, Branch>,
+        source_branch: &str,
+        dst_root: &Path,
+    ) -> Result<()> {
+        if dst_root.exists() {
+            fs::remove_dir_all(dst_root)?;
+        }
+        fs::create_dir_all(dst_root)?;
+        self.snapshot_visible_dir(branches, source_branch, "/", dst_root)
+    }
+
+    fn snapshot_visible_dir(
+        &self,
+        branches: &HashMap<String, Branch>,
+        source_branch: &str,
+        rel_path: &str,
+        dst_root: &Path,
+    ) -> Result<()> {
+        let mut names: Vec<String> = self
+            .collect_dir_names_locked(branches, source_branch, rel_path)?
+            .into_iter()
+            .collect();
+        names.sort();
+
+        for name in names {
+            let child_rel = if rel_path == "/" {
+                format!("/{}", name)
+            } else {
+                format!("{}/{}", rel_path, name)
+            };
+
+            let Some(src) = self.resolve_path_locked(branches, source_branch, &child_rel)? else {
+                continue;
+            };
+            let meta = src.symlink_metadata()?;
+            let dst = dst_root.join(child_rel.trim_start_matches('/'));
+
+            if meta.file_type().is_dir() {
+                fs::create_dir_all(&dst)?;
+                fs::set_permissions(&dst, meta.permissions())?;
+                self.snapshot_visible_dir(branches, source_branch, &child_rel, dst_root)?;
+            } else {
+                storage::copy_entry(&src, &dst)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Collect all candidate file/directory names visible in a directory.
+    /// Branches resolve against their own deltas plus the frozen inherited
+    /// snapshot captured at fork time; main resolves against its delta plus
+    /// the live base directory.
+    pub fn collect_dir_names(&self, branch_name: &str, rel_path: &str) -> Result<HashSet<String>> {
+        let branches = self.branches.read();
+        self.collect_dir_names_locked(&branches, branch_name, rel_path)
+    }
+
+    pub fn resolve_path(&self, branch_name: &str, rel_path: &str) -> Result<Option<PathBuf>> {
+        let branches = self.branches.read();
+        self.resolve_path_locked(&branches, branch_name, rel_path)
     }
 
     /// Returns true if no other branch has `parent == name`.

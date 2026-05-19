@@ -6,7 +6,7 @@ BranchFS is a FUSE-based filesystem that enables speculative branching on top of
 
 | Feature | Description |
 |---------|-------------|
-| Fast Branch Creation | O(1) branch creation with copy-on-write semantics |
+| Snapshot Isolation | Branches capture their inherited parent view at creation time |
 | Commit to Parent | Changes merge into immediate parent branch (or base if parent is main) |
 | Atomic Abort | Instantly discards leaf branch, parent and siblings unaffected |
 | Atomic Commit | Merges leaf branch into parent atomically |
@@ -16,7 +16,7 @@ BranchFS is a FUSE-based filesystem that enables speculative branching on top of
 
 ## Architecture
 
-BranchFS is a FUSE-based filesystem that requires no root privileges. It implements file-level copy-on-write: when a file is modified on a branch, the entire file is lazily copied to the branch's delta storage, while unmodified files are resolved by walking up the branch chain to the base directory. Deletions are tracked via tombstone markers. On commit, changes from a leaf branch are merged into its immediate parent (or applied to the base directory if the parent is main); on abort, the leaf branch's delta storage is simply discarded.
+BranchFS is a FUSE-based filesystem that requires no root privileges. It implements file-level copy-on-write over a frozen inherited view: when a branch is created, BranchFS snapshots the parent's visible tree into the branch's inherited storage. When a file is modified on a branch, the file is copied to the branch's delta storage, and lookups prefer branch deltas/tombstones over the inherited snapshot. Deletions are tracked via tombstone markers. On commit, changes from a leaf branch are merged into its immediate parent (or applied to the base directory if the parent is main); on abort, the leaf branch's delta storage and inherited snapshot are discarded.
 
 ### Why not overlayfs?
 

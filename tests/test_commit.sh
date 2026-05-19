@@ -145,6 +145,8 @@ test_commit_preserves_siblings() {
 
     assert_branch_not_exists "sibling_b" "sibling_b removed after commit"
     assert_branch_exists "sibling_a" "sibling_a preserved after sibling commit"
+    assert_file_exists "$TEST_BASE/sibling_b_file.txt" "sibling_b file committed to base"
+    assert_file_not_exists "$TEST_MNT/@sibling_a/sibling_b_file.txt" "sibling_a does not see sibling_b post-fork commit"
 
     do_unmount
 }

@@ -146,9 +146,9 @@ impl BranchFs {
 
     /// Collect readdir entries for a directory resolved via a specific branch.
     ///
-    /// Walks the full ancestor chain (branch → parent → … → main → base) to
-    /// collect all candidate names, then resolves each via `resolve_path` to
-    /// respect tombstones and determine the correct file type.
+    /// Collects candidate names from the branch delta plus its frozen inherited
+    /// snapshot, then resolves each via `resolve_path` to respect tombstones and
+    /// determine the correct file type.
     ///
     /// `inode_prefix` controls how child inode paths are formed:
     /// - `"/@branch"` for branch subtrees (produces `/@branch/child`)
@@ -165,7 +165,7 @@ impl BranchFs {
             (ino, FileType::Directory, "..".to_string()),
         ];
 
-        // Collect all candidate names from the full branch ancestor chain + base.
+        // Collect all candidate names from the branch delta + inherited view.
         let mut candidates: Vec<String> = match self.manager.collect_dir_names(branch, rel_path) {
             Ok(names) => names.into_iter().collect(),
             Err(_) => return entries,

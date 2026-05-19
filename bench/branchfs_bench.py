@@ -3,7 +3,7 @@
 BranchFS Microbenchmark Suite
 
 Benchmarks:
-1. Branch creation latency vs base directory size (O(1) verification)
+1. Branch creation latency vs base directory size
 2. Commit latency vs modification size
 3. Abort latency
 4. Read/write throughput
@@ -101,7 +101,7 @@ class BranchFSBench:
             file_path.write_bytes(os.urandom(file_size))
 
     # =========================================================================
-    # Benchmark 1: Branch Creation Latency vs Base Size (O(1) verification)
+    # Benchmark 1: Branch Creation Latency vs Base Size
     # =========================================================================
     def bench_branch_creation(self, base_sizes: list[int] = [100, 1000, 10000],
                               iterations: int = 5):
