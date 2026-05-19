@@ -43,11 +43,6 @@ def plot_branch_creation(results: list[dict], output_dir: Path):
     ax.set_title('(a) Branch Creation', fontsize=11)
     ax.grid(True, alpha=0.3)
 
-    # Add horizontal reference line for O(1)
-    avg = sum(y) / len(y)
-    ax.axhline(y=avg, color='red', linestyle='--', alpha=0.5, label=f'Avg: {avg:.0f} μs')
-    ax.legend(fontsize=8)
-
     plt.tight_layout()
     plt.savefig(output_dir / 'branch_creation.pdf', dpi=300, bbox_inches='tight')
     plt.savefig(output_dir / 'branch_creation.png', dpi=150, bbox_inches='tight')

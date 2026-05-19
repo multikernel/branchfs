@@ -168,6 +168,7 @@ test_branch_dir_nested_child() {
 
     # Create parent, then child
     do_create "parent-br" "main"
+    echo "parent content" > "$TEST_MNT/@parent-br/parent_file.txt"
     do_create "child-br" "parent-br"
 
     # @child-br should appear as a top-level @branch dir (flat namespace)
@@ -180,14 +181,17 @@ test_branch_dir_nested_child() {
     echo "child content" > "$TEST_MNT/@child-br/child_file.txt"
     assert_file_exists "$TEST_MNT/@child-br/child_file.txt" "child_file.txt via @child-br"
 
-    # Child branch should see parent's files (inheritance via resolve_path chain)
-    echo "parent content" > "$TEST_MNT/@parent-br/parent_file.txt"
+    # Child branch sees the parent's state as of the child fork.
+    assert_file_exists "$TEST_MNT/@child-br/parent_file.txt" "Child sees parent's fork-time file"
+
+    # Later parent changes are isolated from the already-created child.
+    echo "late parent content" > "$TEST_MNT/@parent-br/late_parent_file.txt"
 
     # Switch root to main so we don't confuse things
     echo "switch:main" > "$TEST_MNT/.branchfs_ctl"
     sleep 0.3
 
-    assert_file_exists "$TEST_MNT/@child-br/parent_file.txt" "Child sees parent's file"
+    assert_file_not_exists "$TEST_MNT/@child-br/late_parent_file.txt" "Child does not see parent's post-fork file"
 
     do_unmount
 }

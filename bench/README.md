@@ -31,7 +31,7 @@ python3 branchfs_bench.py
 python3 branchfs_bench.py --quick
 
 # Specific benchmark
-python3 branchfs_bench.py --bench creation   # Branch creation O(1) test
+python3 branchfs_bench.py --bench creation   # Snapshot creation latency
 python3 branchfs_bench.py --bench commit     # Commit latency
 python3 branchfs_bench.py --bench abort      # Abort latency
 python3 branchfs_bench.py --bench throughput # Read/write throughput
@@ -43,13 +43,13 @@ python3 branchfs_bench.py --latex ../paper/
 
 ## Benchmarks
 
-### 1. Branch Creation Latency (O(1) Verification)
+### 1. Branch Creation Latency
 
 Measures internal branch creation time with varying base directory sizes.
-Validates that branch creation is O(1) - constant time regardless of base size.
+This includes materializing the inherited snapshot used for branch isolation.
 
 - **Parameters**: Base sizes of 100, 1K, 10K files
-- **Expected**: ~300 µs constant latency
+- **Expected**: Scales with visible parent tree size
 
 ### 2. Commit Latency
 
