@@ -97,6 +97,79 @@ fn remove_entry(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// A merge that has been copied to temporary siblings but not yet published.
+///
+/// `stage` copies each source file to a temp sibling of its final destination
+/// (the only fallible step; it touches no existing destination data). `commit`
+/// then renames every temp into place atomically (same-filesystem rename).
+///
+/// If dropped without `commit`, every staged temp is removed and the
+/// destination's existing data is left unchanged. Note: `stage` creates the
+/// destination's parent directories (via `copy_entry`), so a rolled-back merge
+/// may leave empty directories behind — this is benign (no data is written).
+#[derive(Default)]
+struct StagedMerge {
+    /// (temp path, final destination) for each staged file.
+    pairs: Vec<(PathBuf, PathBuf)>,
+    /// Relative paths staged, returned to the caller on `commit` for bookkeeping.
+    merged: Vec<String>,
+    /// Total bytes staged, for the `[BENCH]` log line.
+    bytes: u64,
+    committed: bool,
+}
+
+impl StagedMerge {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Copy `src` to a temp sibling of its final destination under `dest_root`.
+    /// The only fallible step; no existing destination data is touched.
+    fn stage(&mut self, rel_path: &str, src: &Path, dest_root: &Path) -> Result<()> {
+        let dest = dest_root.join(rel_path.trim_start_matches('/'));
+        let tmp = commit_tmp_path(&dest);
+        storage::copy_entry(src, &tmp)?;
+        if let Ok(meta) = src.symlink_metadata() {
+            self.bytes += meta.len();
+        }
+        self.pairs.push((tmp, dest));
+        self.merged.push(rel_path.to_string());
+        Ok(())
+    }
+
+    /// Publish all staged copies by renaming each temp into its final place.
+    /// Returns the relative paths that were merged.
+    fn commit(mut self) -> Result<Vec<String>> {
+        for (tmp, dest) in &self.pairs {
+            fs::rename(tmp, dest)?;
+        }
+        self.committed = true;
+        Ok(std::mem::take(&mut self.merged))
+    }
+}
+
+impl Drop for StagedMerge {
+    fn drop(&mut self) {
+        if !self.committed {
+            for (tmp, _) in &self.pairs {
+                let _ = remove_entry(tmp);
+            }
+        }
+    }
+}
+
+/// Temp sibling path for a commit destination: `<dir>/.branchfs-tmp.<name>`.
+/// The temp lives in the same directory as `dest`, so publishing it is an
+/// atomic same-filesystem rename.
+fn commit_tmp_path(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parent = dest.parent().unwrap_or_else(|| Path::new(""));
+    parent.join(format!(".branchfs-tmp.{}", name))
+}
+
 pub struct Branch {
     pub name: String,
     pub parent: Option<String>,
@@ -897,5 +970,84 @@ impl BranchManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod staged_merge_tests {
+    use super::{commit_tmp_path, StagedMerge};
+    use std::fs;
+
+    fn write(path: &std::path::Path, data: &[u8]) {
+        fs::write(path, data).unwrap();
+    }
+
+    #[test]
+    fn commit_publishes_all_staged_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        write(&src.join("a"), b"new-a");
+        write(&src.join("b"), b"new-b");
+
+        let mut staged = StagedMerge::new();
+        staged.stage("/a", &src.join("a"), &dst).unwrap();
+        staged.stage("/b", &src.join("b"), &dst).unwrap();
+        let merged = staged.commit().unwrap();
+
+        assert_eq!(merged.len(), 2);
+        assert_eq!(fs::read(dst.join("a")).unwrap(), b"new-a");
+        assert_eq!(fs::read(dst.join("b")).unwrap(), b"new-b");
+        // temps are gone after publish
+        assert!(!commit_tmp_path(&dst.join("a")).exists());
+        assert!(!commit_tmp_path(&dst.join("b")).exists());
+    }
+
+    #[test]
+    fn drop_without_commit_removes_temps_and_preserves_dest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        write(&src.join("a"), b"new-a");
+        write(&dst.join("a"), b"old-a"); // pre-existing destination data
+
+        {
+            let mut staged = StagedMerge::new();
+            staged.stage("/a", &src.join("a"), &dst).unwrap();
+            // temp exists while staged, dest still holds old data
+            assert!(commit_tmp_path(&dst.join("a")).exists());
+            assert_eq!(fs::read(dst.join("a")).unwrap(), b"old-a");
+            // dropped here without commit()
+        }
+
+        // temp cleaned up; destination data untouched
+        assert!(!commit_tmp_path(&dst.join("a")).exists());
+        assert_eq!(fs::read(dst.join("a")).unwrap(), b"old-a");
+    }
+
+    #[test]
+    fn failed_stage_propagates_and_cleans_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        write(&src.join("a"), b"new-a");
+        write(&dst.join("a"), b"old-a");
+
+        let mut staged = StagedMerge::new();
+        staged.stage("/a", &src.join("a"), &dst).unwrap();
+        // staging a non-existent source makes copy_entry fail
+        let err = staged.stage("/missing", &src.join("missing"), &dst);
+        assert!(err.is_err());
+        drop(staged);
+
+        // first temp removed, original dest data preserved (no partial publish)
+        assert!(!commit_tmp_path(&dst.join("a")).exists());
+        assert_eq!(fs::read(dst.join("a")).unwrap(), b"old-a");
     }
 }
