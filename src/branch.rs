@@ -768,29 +768,27 @@ impl BranchManager {
         let child_files_dir = branch.files_dir.clone();
 
         if parent_name == "main" {
-            // Direct child of main: apply to base filesystem
-            // Apply tombstones as deletions
+            // Direct child of main: apply to the base filesystem.
+            //
+            // Phase 1 (fallible): copy every delta file to a temp sibling of its
+            // final destination. No existing base data is touched, so any copy
+            // error (ENOSPC, EACCES, EIO, ...) propagates here, `staged` is
+            // dropped (removing the temps), and the branch + its delta are
+            // preserved for retry or abort — never a false success.
+            let mut staged = StagedMerge::new();
+            self.walk_files(&child_files_dir, "", &mut |rel_path, src_path| {
+                staged.stage(rel_path, src_path, &self.base_path)
+            })?;
+
+            // Phase 2 (near-infallible): publish by renaming temps into place,
+            // then apply tombstone deletions to the base.
+            let total_bytes = staged.bytes;
+            let committed_paths = staged.commit()?;
+            let num_files = committed_paths.len() as u64;
             for path in &child_tombstones {
                 let full_path = self.base_path.join(path.trim_start_matches('/'));
                 remove_entry(&full_path)?;
             }
-
-            // Copy delta files to base
-            let mut num_files = 0u64;
-            let mut total_bytes = 0u64;
-            let mut committed_paths = Vec::new();
-            self.walk_files(&child_files_dir, "", &mut |rel_path, src_path| {
-                let dest = self.base_path.join(rel_path.trim_start_matches('/'));
-                if let Some(parent_dir) = dest.parent() {
-                    let _ = fs::create_dir_all(parent_dir);
-                }
-                if let Ok(meta) = src_path.symlink_metadata() {
-                    total_bytes += meta.len();
-                }
-                let _ = storage::copy_entry(src_path, &dest);
-                num_files += 1;
-                committed_paths.push(rel_path.to_string());
-            })?;
 
             // Remove main's delta for committed/tombstoned paths so base
             // takes precedence.  Without this, main's pre-existing delta
@@ -839,6 +837,15 @@ impl BranchManager {
             let parent_files_dir = parent.files_dir.clone();
             let mut parent_tombstones = parent.get_tombstones();
 
+            // Phase 1 (fallible): stage every child delta file as a temp sibling
+            // inside the parent's delta directory. No existing parent data is
+            // touched; a copy error drops `staged`, removing the temps, and the
+            // parent's delta is left unchanged.
+            let mut staged = StagedMerge::new();
+            self.walk_files(&child_files_dir, "", &mut |rel_path, src_path| {
+                staged.stage(rel_path, src_path, &parent_files_dir)
+            })?;
+
             // Step 1: For each child tombstone, remove matching file from parent delta
             // and add tombstone to parent
             for tombstone in &child_tombstones {
@@ -847,16 +854,9 @@ impl BranchManager {
                 parent_tombstones.insert(tombstone.clone());
             }
 
-            // Step 2: Copy child's delta files into parent's delta directory
-            let mut copied_paths = Vec::new();
-            self.walk_files(&child_files_dir, "", &mut |rel_path, src_path| {
-                let dest = parent_files_dir.join(rel_path.trim_start_matches('/'));
-                if let Some(parent_dir) = dest.parent() {
-                    let _ = fs::create_dir_all(parent_dir);
-                }
-                let _ = storage::copy_entry(src_path, &dest);
-                copied_paths.push(rel_path.to_string());
-            })?;
+            // Step 2: publish child's delta files into parent's delta directory.
+            // Phase 2 (near-infallible) of the staged copy above.
+            let copied_paths = staged.commit()?;
 
             // Step 3: For each copied delta file, remove that path from parent's tombstones
             for path in &copied_paths {
@@ -942,7 +942,7 @@ impl BranchManager {
 
     fn walk_files<F>(&self, dir: &Path, prefix: &str, f: &mut F) -> Result<()>
     where
-        F: FnMut(&str, &Path),
+        F: FnMut(&str, &Path) -> Result<()>,
     {
         if !dir.exists() {
             return Ok(());
@@ -965,7 +965,7 @@ impl BranchManager {
             if is_dir {
                 self.walk_files(&path, &rel_path, f)?;
             } else {
-                f(&rel_path, &path);
+                f(&rel_path, &path)?;
             }
         }
 
