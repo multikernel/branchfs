@@ -214,6 +214,60 @@ fn test_ioctl_modify_existing_and_commit() {
     );
 }
 
+// ── Replace a base directory with a file, then COMMIT ───────────────
+//
+// Regression test: committing a branch that turns a base directory into a file
+// (at the same path) must succeed and leave a file in base. A previous
+// implementation published copies before applying deletions, so
+// `rename(tmp_file, base/dir)` hit EISDIR and the commit failed with EIO.
+//
+// The dir->file delta is produced via `rename` (which clears the destination's
+// tombstone), so at commit time there is a delta file over a base directory
+// with no tombstone — exercising the directory-conflict handling in stage_copy.
+
+#[test]
+#[ignore]
+fn test_ioctl_replace_dir_with_file_and_commit() {
+    let fix = TestFixture::new("replace_dir_with_file");
+    // Seed base with an (empty) directory and a file (fixture seeds only files).
+    fs::create_dir_all(fix.base.join("subdir")).unwrap();
+    fs::write(fix.base.join("src.txt"), "payload\n").unwrap();
+    fix.mount();
+    let ctl = fix.open_ctl();
+
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE should succeed");
+    let branch_dir = fix.mnt.join(format!("@{}", branch));
+
+    // Remove the directory, then rename the file onto its (now-free) path.
+    fs::remove_dir(branch_dir.join("subdir")).unwrap();
+    fs::rename(branch_dir.join("src.txt"), branch_dir.join("subdir")).unwrap();
+
+    // Base still has the original directory and file before commit.
+    assert!(fix.base.join("subdir").is_dir());
+    assert!(fix.base.join("src.txt").exists());
+
+    let bctl = fix.open_branch_ctl(&branch);
+    let ret = unsafe { ioctl_commit(bctl.as_raw_fd()) };
+    assert_eq!(ret, 0, "COMMIT should succeed (dir replaced by file)");
+
+    // Base now has a file at that path with the branch's content; the source
+    // file (renamed away) is gone.
+    let meta = fs::symlink_metadata(fix.base.join("subdir")).unwrap();
+    assert!(
+        meta.file_type().is_file(),
+        "base/subdir should be a file after commit, got {:?}",
+        meta.file_type()
+    );
+    assert_eq!(
+        fs::read_to_string(fix.base.join("subdir")).unwrap(),
+        "payload\n"
+    );
+    assert!(
+        !fix.base.join("src.txt").exists(),
+        "renamed-away source should be gone from base"
+    );
+}
+
 // ── CREATE + ABORT ──────────────────────────────────────────────────
 
 #[test]
