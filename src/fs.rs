@@ -540,6 +540,16 @@ impl Filesystem for BranchFs {
             return;
         }
 
+        // Honor staleness before serving a cached fd, exactly like the slow path
+        // and every other callback. A foreign commit (epoch arm) or abort
+        // (is_branch_valid arm) must surface as ESTALE, not a read from a stale
+        // backing file (issue #30). This still skips the resolve()/File::open()
+        // the cache exists to avoid.
+        if self.is_stale() {
+            reply.error(libc::ESTALE);
+            return;
+        }
+
         let epoch = self.current_epoch.load(Ordering::SeqCst);
 
         // Fast path: reuse cached fd for the same inode+epoch (avoids
@@ -665,6 +675,14 @@ impl Filesystem for BranchFs {
         // === Per-branch ctl file ===
         if let Some(branch) = self.branch_for_ctl_ino(ino) {
             self.handle_branch_ctl_write(&branch, data, reply);
+            return;
+        }
+
+        // Same staleness gate as read(): never write through a cached fd after a
+        // foreign commit/abort (issue #30). Placed after the ctl handlers so
+        // commit/abort ctl writes are not themselves gated.
+        if self.is_stale() {
+            reply.error(libc::ESTALE);
             return;
         }
 
@@ -1891,5 +1909,71 @@ impl Filesystem for BranchFs {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::branch::BranchManager;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn test_manager() -> Arc<BranchManager> {
+        let root = std::env::temp_dir().join(format!("branchfs-isstale-{}", uuid::Uuid::new_v4()));
+        let storage = root.join("storage");
+        let base = root.join("base");
+        let work = root.join("work");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        Arc::new(BranchManager::new(storage, base, work, None).unwrap())
+    }
+
+    #[test]
+    fn is_stale_false_when_in_sync() {
+        let mgr = test_manager();
+        let mp = PathBuf::from("/mnt/a");
+        mgr.set_mount_branch(&mp, "main");
+        let fs = BranchFs::new(mgr.clone(), mp, false);
+
+        assert!(!fs.is_stale());
+    }
+
+    #[test]
+    fn is_stale_true_after_foreign_commit() {
+        // A commit elsewhere advances the global epoch; this mount's local epoch
+        // lags, so the epoch arm of is_stale() fires. This is what gates the
+        // fast paths against reading a backing file a commit just replaced.
+        let mgr = test_manager();
+        let mp = PathBuf::from("/mnt/a");
+        mgr.set_mount_branch(&mp, "main");
+        let fs = BranchFs::new(mgr.clone(), mp, false);
+        assert!(!fs.is_stale());
+
+        mgr.create_branch("feat", "main").unwrap();
+        mgr.commit("feat").unwrap();
+
+        assert!(fs.is_stale(), "a foreign commit must make the mount stale");
+    }
+
+    #[test]
+    fn is_stale_true_after_branch_aborted() {
+        // Abort removes the branch but does NOT bump the epoch — staleness is
+        // signaled through is_branch_valid(). This is how ESTALE implements
+        // abort, and why the fast-path gate must call full is_stale(), not just
+        // compare epochs.
+        let mgr = test_manager();
+        let mp = PathBuf::from("/mnt/a");
+        mgr.create_branch("feat", "main").unwrap();
+        mgr.set_mount_branch(&mp, "feat");
+        let fs = BranchFs::new(mgr.clone(), mp, false);
+        assert!(!fs.is_stale());
+
+        mgr.abort("feat").unwrap();
+
+        assert!(
+            fs.is_stale(),
+            "a foreign abort must make the mount stale via branch removal"
+        );
     }
 }
