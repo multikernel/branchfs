@@ -1030,8 +1030,32 @@ impl BranchManager {
 mod staged_merge_tests {
     use super::{commit_side_path, StagedMerge};
     use std::fs;
+    use std::path::{Path, PathBuf};
 
-    fn write(path: &std::path::Path, data: &[u8]) {
+    /// A unique temp directory removed on drop (even if a test panics).
+    /// Matches the manual-cleanup style of the integration tests and avoids a
+    /// dev-dependency, reusing the `uuid` crate already in `[dependencies]`.
+    struct TmpDir(PathBuf);
+
+    impl TmpDir {
+        fn new() -> Self {
+            let p = std::env::temp_dir().join(format!("branchfs-test-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&p).unwrap();
+            TmpDir(p)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write(path: &Path, data: &[u8]) {
         fs::write(path, data).unwrap();
     }
 
@@ -1045,7 +1069,7 @@ mod staged_merge_tests {
 
     #[test]
     fn commit_publishes_all_staged_files() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = TmpDir::new();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         fs::create_dir_all(&src).unwrap();
@@ -1068,7 +1092,7 @@ mod staged_merge_tests {
 
     #[test]
     fn commit_publishes_nested_paths() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = TmpDir::new();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         fs::create_dir_all(src.join("sub")).unwrap();
@@ -1087,7 +1111,7 @@ mod staged_merge_tests {
 
     #[test]
     fn drop_without_commit_removes_temps_and_preserves_dest() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = TmpDir::new();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         fs::create_dir_all(&src).unwrap();
@@ -1111,7 +1135,7 @@ mod staged_merge_tests {
 
     #[test]
     fn failed_stage_propagates_and_cleans_up() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = TmpDir::new();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         fs::create_dir_all(&src).unwrap();
@@ -1133,7 +1157,7 @@ mod staged_merge_tests {
 
     #[test]
     fn stage_delete_then_commit_removes_target() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = TmpDir::new();
         let dst = tmp.path().join("dst");
         fs::create_dir_all(&dst).unwrap();
         write(&dst.join("a"), b"old-a");
@@ -1152,7 +1176,7 @@ mod staged_merge_tests {
 
     #[test]
     fn stage_delete_rolled_back_on_drop() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = TmpDir::new();
         let dst = tmp.path().join("dst");
         fs::create_dir_all(&dst).unwrap();
         write(&dst.join("a"), b"old-a");
@@ -1171,7 +1195,7 @@ mod staged_merge_tests {
 
     #[test]
     fn stage_delete_missing_target_is_noop() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = TmpDir::new();
         let dst = tmp.path().join("dst");
         fs::create_dir_all(&dst).unwrap();
 
@@ -1185,7 +1209,7 @@ mod staged_merge_tests {
         // Regression for the dir->file commit case: a base directory tombstoned
         // and replaced by a file at the same path. Staging the deletion first
         // clears the directory so the file can be published.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = TmpDir::new();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         fs::create_dir_all(&src).unwrap();
@@ -1208,7 +1232,7 @@ mod staged_merge_tests {
         // A delta file at a path where the destination is a directory, with no
         // staged deletion (reachable via rename, which clears the tombstone):
         // stage_copy must clear the directory itself so publish can place the file.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = TmpDir::new();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         fs::create_dir_all(&src).unwrap();
@@ -1233,7 +1257,7 @@ mod staged_merge_tests {
     fn replace_directory_with_file_rolls_back_on_failure() {
         // If a copy fails after the directory deletion was staged, the dropped
         // StagedMerge must restore the original directory and its contents.
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = TmpDir::new();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
         fs::create_dir_all(&src).unwrap();
