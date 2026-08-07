@@ -982,6 +982,7 @@ impl Filesystem for BranchFs {
                     use std::os::unix::fs::PermissionsExt;
                     let perm = std::fs::Permissions::from_mode(mode & !umask);
                     let _ = std::fs::set_permissions(&delta, perm);
+                    self.revive_path(&branch, &rel_path);
                     let inode_path = format!("/@{}{}", branch, rel_path);
                     let ino = self.inodes.get_or_create(&inode_path, false);
                     if let Some(attr) = self.make_attr(ino, &delta) {
@@ -1016,6 +1017,7 @@ impl Filesystem for BranchFs {
                             use std::os::unix::fs::PermissionsExt;
                             let perm = std::fs::Permissions::from_mode(mode & !umask);
                             let _ = std::fs::set_permissions(&delta, perm);
+                            self.revive_path(&self.get_branch_name(), &path);
                             if self.is_stale() {
                                 let _ = std::fs::remove_file(&delta);
                                 reply.error(libc::ESTALE);
@@ -1282,13 +1284,13 @@ impl Filesystem for BranchFs {
             if dst_existed {
                 b.add_tombstone(&dst_rel)?;
             }
-            b.remove_tombstone(&dst_rel);
             Ok(())
         });
         if result.is_err() {
             reply.error(libc::EIO);
             return;
         }
+        self.revive_path(&branch, &dst_rel);
 
         if src_is_root && self.is_stale() {
             reply.error(libc::ESTALE);
@@ -1682,6 +1684,7 @@ impl Filesystem for BranchFs {
                     use std::os::unix::fs::PermissionsExt;
                     let perm = std::fs::Permissions::from_mode(mode & !umask);
                     let _ = std::fs::set_permissions(&delta, perm);
+                    self.revive_path(&branch, &rel_path);
                     let inode_path = format!("/@{}{}", branch, rel_path);
                     let ino = self.inodes.get_or_create(&inode_path, true);
                     if let Some(attr) = self.make_attr(ino, &delta) {
@@ -1710,6 +1713,7 @@ impl Filesystem for BranchFs {
                             use std::os::unix::fs::PermissionsExt;
                             let perm = std::fs::Permissions::from_mode(mode & !umask);
                             let _ = std::fs::set_permissions(&delta, perm);
+                            self.revive_path(&self.get_branch_name(), &path);
                             if self.is_stale() {
                                 let _ = std::fs::remove_dir_all(&delta);
                                 reply.error(libc::ESTALE);
@@ -1817,6 +1821,7 @@ impl Filesystem for BranchFs {
             }
             match std::os::unix::fs::symlink(target, &delta) {
                 Ok(()) => {
+                    self.revive_path(&branch, &rel_path);
                     let inode_path = format!("/@{}{}", branch, rel_path);
                     let ino = self.inodes.get_or_create(&inode_path, false);
                     match self.make_attr(ino, &delta) {
@@ -1844,6 +1849,7 @@ impl Filesystem for BranchFs {
                     }
                     match std::os::unix::fs::symlink(target, &delta) {
                         Ok(()) => {
+                            self.revive_path(&self.get_branch_name(), &path);
                             if self.is_stale() {
                                 let _ = std::fs::remove_file(&delta);
                                 reply.error(libc::ESTALE);
