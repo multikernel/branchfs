@@ -234,6 +234,66 @@ test_synthetic_entry_ownership() {
 }
 
 # Run tests
+test_recreate_file_after_delete() {
+    setup
+    do_mount
+    echo "first content" > "$TEST_MNT/recreate.txt"
+    assert_file_contains "$TEST_MNT/recreate.txt" "first content" "File created with first content"
+    rm "$TEST_MNT/recreate.txt"
+    assert_file_not_exists "$TEST_MNT/recreate.txt" "File deleted"
+    echo "second content" > "$TEST_MNT/recreate.txt"
+
+    # readdir forces a fresh resolution through resolve_path (unlike stat, which
+    # is masked by the kernel's positive dentry cache from create)
+    assert "ls '$TEST_MNT' | grep -qx 'recreate.txt'" "File recreated with same name visible in listing"
+    assert_file_contains "$TEST_MNT/recreate.txt" "second content" "Recreated file has second content"
+
+    local delta_dir="$TEST_STORAGE/branches/main/files"
+    local count
+    count=$(ls "$delta_dir/recreate.txt" 2>/dev/null | wc -l)
+    assert_eq "$count" "1" "Exactly one delta entry for recreated file (no orphan)"
+    do_unmount
+}
+
+test_recreate_dir_after_delete() {
+    setup
+    do_mount
+    mkdir "$TEST_MNT/recreate_dir"
+    assert "[[ -d '$TEST_MNT/recreate_dir' ]]" "Directory created"
+    rmdir "$TEST_MNT/recreate_dir"
+    assert "[[ ! -d '$TEST_MNT/recreate_dir' ]]" "Directory deleted"
+    mkdir "$TEST_MNT/recreate_dir"
+    assert "[[ -d '$TEST_MNT/recreate_dir' ]]" "Directory recreated with same name"
+    do_unmount
+}
+
+test_recreate_symlink_after_delete() {
+    setup
+    do_mount
+    echo "target" > "$TEST_MNT/recreate_target.txt"
+    ln -s recreate_target.txt "$TEST_MNT/recreate_link"
+    assert "[[ -L '$TEST_MNT/recreate_link' ]]" "Symlink created"
+    rm "$TEST_MNT/recreate_link"
+    assert "[[ ! -L '$TEST_MNT/recreate_link' ]]" "Symlink deleted"
+    ln -s recreate_target.txt "$TEST_MNT/recreate_link"
+    assert "[[ -L '$TEST_MNT/recreate_link' ]]" "Symlink recreated with same name"
+    do_unmount
+}
+
+test_recreate_file_after_delete_in_branch() {
+    setup
+    do_mount
+    do_create "recreate_b" "main"
+    echo "branch first" > "$TEST_MNT/@recreate_b/recreate.txt"
+    assert_file_contains "$TEST_MNT/@recreate_b/recreate.txt" "branch first" "Branch file created"
+    rm "$TEST_MNT/@recreate_b/recreate.txt"
+    assert_file_not_exists "$TEST_MNT/@recreate_b/recreate.txt" "Branch file deleted"
+    echo "branch second" > "$TEST_MNT/@recreate_b/recreate.txt"
+    assert_file_exists "$TEST_MNT/@recreate_b/recreate.txt" "Branch file recreated with same name"
+    assert_file_contains "$TEST_MNT/@recreate_b/recreate.txt" "branch second" "Branch recreated file has second content"
+    do_unmount
+}
+
 run_test "Read Base Files" test_read_base_files
 run_test "Write New File in Branch" test_write_new_file_in_branch
 run_test "Modify Existing File (COW)" test_modify_existing_file_cow
@@ -247,5 +307,9 @@ run_test "Chmod File" test_chmod_file
 run_test "Chmod Directory" test_chmod_directory
 run_test "Chmod Existing File (COW)" test_chmod_existing_file_cow
 run_test "Synthetic Entry Ownership" test_synthetic_entry_ownership
+run_test "Recreate File After Delete" test_recreate_file_after_delete
+run_test "Recreate Dir After Delete" test_recreate_dir_after_delete
+run_test "Recreate Symlink After Delete" test_recreate_symlink_after_delete
+run_test "Recreate File After Delete in Branch" test_recreate_file_after_delete_in_branch
 
 print_summary

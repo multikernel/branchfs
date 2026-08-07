@@ -39,6 +39,15 @@ impl BranchFs {
             .unwrap()
     }
 
+    /// Clear (revive) a tombstone for `rel_path` in the given branch
+    /// Note that every creation should call this to handle re-creations correctly
+    pub(crate) fn revive_path(&self, branch: &str, rel_path: &str) {
+        let _ = self.manager.with_branch(branch, |b| {
+            b.remove_tombstone(rel_path);
+            Ok(())
+        });
+    }
+
     pub(crate) fn ensure_cow(&self, rel_path: &str) -> std::io::Result<std::path::PathBuf> {
         self.ensure_cow_for_branch(&self.get_branch_name(), rel_path)
     }
