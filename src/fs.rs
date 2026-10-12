@@ -272,6 +272,180 @@ impl BranchFs {
         let path = self.inodes.get_path(ino)?;
         Some(classify_path(&path))
     }
+
+    /// Shared body of `unlink` and `rmdir`. `want_dir` selects the POSIX
+    /// rule: `unlink` rejects a directory with EISDIR, `rmdir` rejects a
+    /// missing path with ENOENT and a directory with visible children with
+    /// ENOTEMPTY. Only a genuinely empty directory is tombstoned.
+    fn remove_common(&mut self, parent: u64, name: &OsStr, want_dir: bool, reply: ReplyEmpty) {
+        let parent_path = match self.inodes.get_path(parent) {
+            Some(p) => p,
+            None => {
+                reply.error(libc::ENOENT);
+                return;
+            }
+        };
+
+        let name_str = name.to_string_lossy();
+
+        let branch_ctx = match classify_path(&parent_path) {
+            PathContext::BranchDir(b) => Some((b, "/".to_string())),
+            PathContext::BranchPath(b, rel) => Some((b, rel)),
+            _ => None,
+        };
+
+        if let Some((branch, parent_rel)) = branch_ctx {
+            // Can't unlink @child dirs or .branchfs_ctl
+            if name_str.starts_with('@') || *name_str == *CTL_FILE {
+                reply.error(libc::EPERM);
+                return;
+            }
+
+            if !self.manager.is_branch_valid(&branch) {
+                reply.error(libc::ENOENT);
+                return;
+            }
+
+            let rel_path = if parent_rel == "/" {
+                format!("/{}", name_str)
+            } else {
+                format!("{}/{}", parent_rel, name_str)
+            };
+
+            let resolved = self.manager.resolve_path(&branch, &rel_path).ok().flatten();
+            if !want_dir {
+                if resolved
+                    .as_ref()
+                    .and_then(|p| p.symlink_metadata().ok())
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+                {
+                    reply.error(libc::EISDIR);
+                    return;
+                }
+            } else if resolved.is_none() {
+                reply.error(libc::ENOENT);
+                return;
+            } else if !self.branch_dir_is_empty(&branch, &rel_path) {
+                reply.error(libc::ENOTEMPTY);
+                return;
+            }
+            let result = self.manager.with_branch(&branch, |b| {
+                b.add_tombstone(&rel_path)?;
+                let freed = Self::remove_delta_entry(&b.delta_path(&rel_path))?;
+                self.manager.quota.sub(freed);
+                Ok(())
+            });
+
+            if result.is_err() {
+                reply.error(libc::EIO);
+                return;
+            }
+
+            let inode_path = format!("/@{}{}", branch, rel_path);
+            self.inodes.remove(&inode_path);
+            reply.ok();
+        } else {
+            // Root-path unlink (or EPERM for ctl files)
+            match classify_path(&parent_path) {
+                PathContext::BranchCtl(_) | PathContext::RootCtl => {
+                    reply.error(libc::EPERM);
+                }
+                PathContext::RootPath(rp) => {
+                    let path = if rp == "/" {
+                        format!("/{}", name_str)
+                    } else {
+                        format!("{}/{}", rp, name_str)
+                    };
+
+                    let branch = self.get_branch_name();
+                    let resolved = self.manager.resolve_path(&branch, &path).ok().flatten();
+                    if !want_dir {
+                        if resolved
+                            .as_ref()
+                            .and_then(|p| p.symlink_metadata().ok())
+                            .map(|m| m.is_dir())
+                            .unwrap_or(false)
+                        {
+                            reply.error(libc::EISDIR);
+                            return;
+                        }
+                    } else if resolved.is_none() {
+                        reply.error(libc::ENOENT);
+                        return;
+                    } else if !self.branch_dir_is_empty(&branch, &path) {
+                        reply.error(libc::ENOTEMPTY);
+                        return;
+                    }
+
+                    let result = self.manager.with_branch(&self.get_branch_name(), |b| {
+                        b.add_tombstone(&path)?;
+                        let freed = Self::remove_delta_entry(&b.delta_path(&path))?;
+                        self.manager.quota.sub(freed);
+                        Ok(())
+                    });
+
+                    if result.is_err() || self.is_stale() {
+                        reply.error(libc::ESTALE);
+                        return;
+                    }
+
+                    self.inodes.remove(&path);
+                    reply.ok();
+                }
+                _ => {
+                    reply.error(libc::ENOENT);
+                }
+            }
+        }
+    }
+
+    /// Whether the directory at `rel_path` reports no visible children.
+    fn branch_dir_is_empty(&self, branch: &str, rel_path: &str) -> bool {
+        self.collect_readdir_entries(branch, rel_path, 0, "")
+            .iter()
+            .all(|(_, _, name)| name == "." || name == "..")
+    }
+
+    /// A directory delta is stored as a real directory, so it must be removed
+    /// with a directory-aware primitive; a plain unlink fails with EISDIR.
+    /// A missing path releases nothing.
+    fn remove_delta_entry(path: &Path) -> std::io::Result<u64> {
+        let meta = match path.symlink_metadata() {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        if meta.file_type().is_dir() {
+            let freed = Self::dir_file_bytes(path);
+            std::fs::remove_dir_all(path)?;
+            Ok(freed)
+        } else {
+            let freed = meta.len();
+            std::fs::remove_file(path)?;
+            Ok(freed)
+        }
+    }
+
+    /// Total size of regular files under `path`, used to release quota once a
+    /// directory delta is removed. Directory inode sizes are not counted, so
+    /// this mirrors how writes add to the quota.
+    fn dir_file_bytes(path: &Path) -> u64 {
+        let mut total = 0;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let child = entry.path();
+                if let Ok(m) = child.symlink_metadata() {
+                    if m.file_type().is_dir() {
+                        total += Self::dir_file_bytes(&child);
+                    } else {
+                        total += m.len();
+                    }
+                }
+            }
+        }
+        total
+    }
 }
 
 impl Filesystem for BranchFs {
@@ -1039,100 +1213,11 @@ impl Filesystem for BranchFs {
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let parent_path = match self.inodes.get_path(parent) {
-            Some(p) => p,
-            None => {
-                reply.error(libc::ENOENT);
-                return;
-            }
-        };
-
-        let name_str = name.to_string_lossy();
-
-        let branch_ctx = match classify_path(&parent_path) {
-            PathContext::BranchDir(b) => Some((b, "/".to_string())),
-            PathContext::BranchPath(b, rel) => Some((b, rel)),
-            _ => None,
-        };
-
-        if let Some((branch, parent_rel)) = branch_ctx {
-            // Can't unlink @child dirs or .branchfs_ctl
-            if name_str.starts_with('@') || *name_str == *CTL_FILE {
-                reply.error(libc::EPERM);
-                return;
-            }
-
-            if !self.manager.is_branch_valid(&branch) {
-                reply.error(libc::ENOENT);
-                return;
-            }
-
-            let rel_path = if parent_rel == "/" {
-                format!("/{}", name_str)
-            } else {
-                format!("{}/{}", parent_rel, name_str)
-            };
-
-            let result = self.manager.with_branch(&branch, |b| {
-                b.add_tombstone(&rel_path)?;
-                let delta = b.delta_path(&rel_path);
-                if delta.exists() {
-                    let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
-                    std::fs::remove_file(&delta)?;
-                    self.manager.quota.sub(freed);
-                }
-                Ok(())
-            });
-
-            if result.is_err() {
-                reply.error(libc::EIO);
-                return;
-            }
-
-            let inode_path = format!("/@{}{}", branch, rel_path);
-            self.inodes.remove(&inode_path);
-            reply.ok();
-        } else {
-            // Root-path unlink (or EPERM for ctl files)
-            match classify_path(&parent_path) {
-                PathContext::BranchCtl(_) | PathContext::RootCtl => {
-                    reply.error(libc::EPERM);
-                }
-                PathContext::RootPath(rp) => {
-                    let path = if rp == "/" {
-                        format!("/{}", name_str)
-                    } else {
-                        format!("{}/{}", rp, name_str)
-                    };
-
-                    let result = self.manager.with_branch(&self.get_branch_name(), |b| {
-                        b.add_tombstone(&path)?;
-                        let delta = b.delta_path(&path);
-                        if delta.exists() {
-                            let freed = delta.symlink_metadata().map(|m| m.len()).unwrap_or(0);
-                            std::fs::remove_file(&delta)?;
-                            self.manager.quota.sub(freed);
-                        }
-                        Ok(())
-                    });
-
-                    if result.is_err() || self.is_stale() {
-                        reply.error(libc::ESTALE);
-                        return;
-                    }
-
-                    self.inodes.remove(&path);
-                    reply.ok();
-                }
-                _ => {
-                    reply.error(libc::ENOENT);
-                }
-            }
-        }
+        self.remove_common(parent, name, false, reply);
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        self.unlink(_req, parent, name, reply);
+        self.remove_common(parent, name, true, reply);
     }
 
     fn rename(
@@ -1974,6 +2059,54 @@ mod tests {
         assert!(
             fs.is_stale(),
             "a foreign abort must make the mount stale via branch removal"
+        );
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("branchfs-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn remove_delta_entry_removes_directory_and_reports_file_bytes() {
+        let root = temp_dir("delta-dir");
+        let dir = root.join("tree");
+        std::fs::create_dir_all(dir.join("inner")).unwrap();
+        std::fs::write(dir.join("inner/a"), b"abcd").unwrap();
+        std::fs::write(dir.join("b"), b"ef").unwrap();
+
+        let freed = BranchFs::remove_delta_entry(&dir).unwrap();
+        assert!(
+            !dir.exists(),
+            "a directory delta must be removed with a directory-aware primitive"
+        );
+        assert_eq!(
+            freed, 6,
+            "regular file bytes under the directory are released"
+        );
+    }
+
+    #[test]
+    fn remove_delta_entry_removes_file_and_symlink() {
+        let root = temp_dir("delta-file");
+        let file = root.join("f");
+        std::fs::write(&file, b"12345").unwrap();
+        assert_eq!(BranchFs::remove_delta_entry(&file).unwrap(), 5);
+        assert!(!file.exists());
+
+        let link = root.join("l");
+        std::os::unix::fs::symlink("target", &link).unwrap();
+        assert_eq!(BranchFs::remove_delta_entry(&link).unwrap(), 6);
+        assert!(!link.exists());
+    }
+
+    #[test]
+    fn remove_delta_entry_missing_path_releases_nothing() {
+        let root = temp_dir("delta-missing");
+        assert_eq!(
+            BranchFs::remove_delta_entry(&root.join("absent")).unwrap(),
+            0
         );
     }
 }

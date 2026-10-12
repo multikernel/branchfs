@@ -97,6 +97,26 @@ fn remove_entry(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Whether `dest` contains a child of `src` that staging `src` as a deletion
+/// would remove without the tombstone covering it.
+///
+/// `deleted` reports whether a child name is tombstoned by the same branch. A
+/// child that is neither tombstoned nor present in `src` (the commit's delta)
+/// survives the tombstone and must not be discarded by `remove_dir_all`.
+fn dest_has_uncovered_children(src: &Path, dest: &Path, deleted: impl Fn(&str) -> bool) -> bool {
+    let Ok(entries) = fs::read_dir(dest) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if deleted(&name) || src.join(&name).symlink_metadata().is_ok() {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
 /// An in-progress merge that prepares all of its destructive work as
 /// rollback-able side files, then publishes it in one near-infallible phase.
 ///
@@ -820,6 +840,24 @@ impl BranchManager {
         if parent_name == "main" {
             // Direct child of main: apply to the base filesystem atomically.
             //
+            // A tombstone naming a directory cannot be replayed precisely:
+            // `stage_delete` renames the whole directory aside, discarding
+            // children the tombstone does not cover. Refuse before staging.
+            for path in &child_tombstones {
+                let dest = self.base_path.join(path.trim_start_matches('/'));
+                if dest.symlink_metadata().map(|m| m.is_dir()).unwrap_or(false)
+                    && dest_has_uncovered_children(
+                        &child_files_dir.join(path.trim_start_matches('/')),
+                        &dest,
+                        |name| child_tombstones.contains(&format!("{}/{}", path, name)),
+                    )
+                {
+                    return Err(BranchError::Invalid(format!(
+                        "tombstone '{path}' covers a non-empty base directory"
+                    )));
+                }
+            }
+
             // Phase 1 (rollback-able): stage tombstone deletions (rename the
             // base entries aside) and copy every delta file to a temp sibling.
             // Deletions are staged before copies so a path whose type changed
@@ -828,6 +866,7 @@ impl BranchManager {
             // here propagates, `staged` is dropped (temps removed, trashed
             // entries restored), and the branch + its delta are preserved for
             // retry or abort — never a false success or a partial mutation.
+
             let mut staged = StagedMerge::new();
             for path in &child_tombstones {
                 let full_path = self.base_path.join(path.trim_start_matches('/'));
@@ -890,6 +929,27 @@ impl BranchManager {
             let parent_files_dir = parent.files_dir.clone();
             let mut parent_tombstones = parent.get_tombstones();
 
+            // A child tombstone naming a directory in the parent's delta must
+            // not swallow that directory's surviving children. Check before
+            // any entry is renamed aside.
+            for tombstone in &child_tombstones {
+                let parent_delta = parent_files_dir.join(tombstone.trim_start_matches('/'));
+                if parent_delta
+                    .symlink_metadata()
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
+                    && dest_has_uncovered_children(
+                        &child_files_dir.join(tombstone.trim_start_matches('/')),
+                        &parent_delta,
+                        |name| child_tombstones.contains(&format!("{}/{}", tombstone, name)),
+                    )
+                {
+                    return Err(BranchError::Invalid(format!(
+                        "tombstone '{tombstone}' covers a non-empty parent delta"
+                    )));
+                }
+            }
+
             // Phase 1 (rollback-able): stage the merge into the parent's delta
             // directory. For each child tombstone, stage the deletion of any
             // matching parent-delta entry (renamed aside) and record the
@@ -897,6 +957,7 @@ impl BranchManager {
             // Deletions are staged before copies so a type change at a path
             // (e.g. a directory replaced by a file) is cleared first. Any error
             // here drops `staged`, restoring the parent's delta untouched.
+
             let mut staged = StagedMerge::new();
             for tombstone in &child_tombstones {
                 let parent_delta = parent_files_dir.join(tombstone.trim_start_matches('/'));
@@ -1028,7 +1089,8 @@ impl BranchManager {
 
 #[cfg(test)]
 mod staged_merge_tests {
-    use super::{commit_side_path, StagedMerge};
+    use super::{commit_side_path, dest_has_uncovered_children, BranchManager, StagedMerge};
+    use crate::error::BranchError;
     use std::fs;
     use std::path::{Path, PathBuf};
 
@@ -1291,5 +1353,74 @@ mod staged_merge_tests {
         let p2 = dir.join(OsStr::from_bytes(b"\xfe"));
         // Lossy conversion would map both to U+FFFD and collide; raw OsStr must not.
         assert_ne!(commit_side_path(&p1, "tmp"), commit_side_path(&p2, "tmp"));
+    }
+
+    #[test]
+    fn uncovered_children_detects_live_base_entries() {
+        let tmp = TmpDir::new();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        write(&dst.join("keep"), b"live");
+
+        assert!(
+            dest_has_uncovered_children(&src, &dst, |_| false),
+            "a base child with no delta entry must be reported as uncovered"
+        );
+        assert!(
+            !dest_has_uncovered_children(&src, &dst, |name| name == "keep"),
+            "a tombstoned child is covered by the tombstone"
+        );
+
+        write(&src.join("keep"), b"delta");
+        assert!(
+            !dest_has_uncovered_children(&src, &dst, |_| false),
+            "a child present in the commit delta is covered"
+        );
+    }
+
+    #[test]
+    fn uncovered_children_ignores_covered_nested_child() {
+        let tmp = TmpDir::new();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        write(&dst.join("gone"), b"live");
+
+        assert!(
+            !dest_has_uncovered_children(&src, &dst, |name| name == "gone"),
+            "a child tombstoned by the staging branch is covered"
+        );
+    }
+
+    /// Commit must refuse a branch whose tombstone names a directory that still
+    /// has visible children, rather than deleting the whole directory from the
+    /// destination.
+    #[test]
+    fn commit_refuses_tombstoned_nonempty_directory() {
+        let tmp = TmpDir::new();
+        let storage = tmp.path().join("storage");
+        let base = tmp.path().join("base");
+        fs::create_dir_all(base.join("a/b")).unwrap();
+        write(&base.join("a/keep"), b"keep");
+        write(&base.join("a/b/keep"), b"keep");
+
+        let mgr = BranchManager::new(storage, base.clone(), base.clone(), None).unwrap();
+        mgr.create_branch("feat", "main").unwrap();
+        mgr.with_branch("feat", |b| b.add_tombstone("/a/b"))
+            .unwrap();
+
+        let err = mgr.commit("feat").unwrap_err();
+        assert!(
+            matches!(err, BranchError::Invalid(_)),
+            "commit must reject the imprecise tombstone, got {err:?}"
+        );
+        assert!(
+            base.join("a/b/keep").exists(),
+            "the destination subtree must survive a refused commit"
+        );
+        assert!(mgr.is_branch_valid("feat"), "branch must remain for abort");
     }
 }

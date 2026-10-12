@@ -177,6 +177,44 @@ test_commit_non_leaf_fails() {
     do_unmount
 }
 
+# Regression for rmdir probing: removing a leaf must not tombstone non-empty
+# ancestors, and committing must leave their surviving siblings in the base.
+test_commit_preserves_ancestors_after_rmdir_probe() {
+    setup
+    mkdir -p "$TEST_BASE/a/b/c"
+    echo keep > "$TEST_BASE/a/keep"
+    echo keep > "$TEST_BASE/a/b/keep"
+    echo target > "$TEST_BASE/a/b/c/target"
+    do_mount
+    do_create "rmdir_probe" "main"
+
+    rm -f "$TEST_MNT/@rmdir_probe/a/b/c/target"
+    rmdir "$TEST_MNT/@rmdir_probe/a/b/c"
+
+    # Climbing must stop: both ancestors still hold live siblings.
+    if rmdir "$TEST_MNT/@rmdir_probe/a/b" 2>/dev/null; then
+        TESTS_RUN=$((TESTS_RUN + 1))
+        TESTS_FAILED=$((TESTS_FAILED + 1))
+        echo -e "  ${RED}✗${NC} rmdir of non-empty a/b should fail"
+    else
+        TESTS_RUN=$((TESTS_RUN + 1))
+        TESTS_PASSED=$((TESTS_PASSED + 1))
+        echo -e "  ${GREEN}✓${NC} rmdir of non-empty a/b refused"
+    fi
+
+    assert_file_exists "$TEST_MNT/@rmdir_probe/a/keep" "a/keep survives the probe"
+    assert_file_exists "$TEST_MNT/@rmdir_probe/a/b/keep" "a/b/keep survives the probe"
+
+    do_commit
+
+    assert "[[ -d '$TEST_BASE/a' ]]" "a survives in base after commit"
+    assert_file_exists "$TEST_BASE/a/keep" "a/keep survives in base after commit"
+    assert_file_exists "$TEST_BASE/a/b/keep" "a/b/keep survives in base after commit"
+    assert "[[ ! -e '$TEST_BASE/a/b/c' ]]" "emptied a/b/c removed from base"
+
+    do_unmount
+}
+
 # Run tests
 run_test "Commit New File" test_commit_new_file
 run_test "Commit Modified File" test_commit_modified_file
@@ -185,5 +223,6 @@ run_test "Commit Switches to Main" test_commit_switches_to_main
 run_test "Commit Nested Branches" test_commit_nested_branches
 run_test "Commit Preserves Siblings" test_commit_preserves_siblings
 run_test "Commit Non-Leaf Fails" test_commit_non_leaf_fails
+run_test "Commit Preserves Ancestors After rmdir Probe" test_commit_preserves_ancestors_after_rmdir_probe
 
 print_summary

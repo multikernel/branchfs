@@ -917,6 +917,115 @@ fn test_commit_deletion_visible_at_mount_root() {
     );
 }
 
+/// Regression: `rmdir` must return ENOTEMPTY for a directory that still has
+/// visible children, and must not tombstone it. Removal tools probe upward
+/// through parents and rely on ENOTEMPTY to stop climbing; without it they
+/// tombstone non-empty ancestors, hiding subtrees from the branch and
+/// replaying as a recursive delete of the base on commit.
+#[test]
+#[ignore]
+fn test_rmdir_refuses_nonempty_directory_and_preserves_subtree() {
+    let fix = TestFixture::new("rmdir_nonempty");
+    fs::create_dir_all(fix.base.join("a/b/c")).unwrap();
+    fs::write(fix.base.join("a/keep"), "keep\n").unwrap();
+    fs::write(fix.base.join("a/b/keep"), "keep\n").unwrap();
+    fs::write(fix.base.join("a/b/c/target"), "target\n").unwrap();
+    fix.mount();
+
+    let ctl = fix.open_ctl();
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+
+    // Remove the leaf file, then remove the now-empty directory.
+    fs::remove_file(bdir.join("a/b/c/target")).unwrap();
+    fs::remove_dir(bdir.join("a/b/c")).expect("a/b/c is empty and removable");
+
+    // `a/b` and `a` still contain visible children.
+    let err = fs::remove_dir(bdir.join("a/b")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ENOTEMPTY));
+    let err = fs::remove_dir(bdir.join("a")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::ENOTEMPTY));
+
+    // The surviving subtree must still resolve through the branch.
+    assert_eq!(fs::read_to_string(bdir.join("a/keep")).unwrap(), "keep\n");
+    assert_eq!(fs::read_to_string(bdir.join("a/b/keep")).unwrap(), "keep\n");
+    let entries: Vec<String> = fs::read_dir(&bdir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        entries.contains(&"a".to_string()),
+        "non-empty ancestor must stay visible; got: {:?}",
+        entries
+    );
+
+    // Committing must not remove `a` from the base.
+    let bctl = fix.open_branch_ctl(&branch);
+    let ret = unsafe { ioctl_commit(bctl.as_raw_fd()) };
+    assert_eq!(ret, 0, "commit should succeed");
+    assert!(fix.base.join("a").exists(), "`a` must survive in the base");
+    assert_eq!(
+        fs::read_to_string(fix.base.join("a/keep")).unwrap(),
+        "keep\n"
+    );
+    assert!(!fix.base.join("a/b/c").exists(), "emptied dir is deleted");
+}
+
+/// `unlink` on a directory must fail with EISDIR rather than tombstoning it.
+#[test]
+#[ignore]
+fn test_unlink_directory_returns_eisdir() {
+    let fix = TestFixture::new("unlink_dir");
+    fix.mount();
+
+    let ctl = fix.open_ctl();
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+
+    let err = fs::remove_file(bdir.join("subdir")).unwrap_err();
+    assert_eq!(err.raw_os_error(), Some(libc::EISDIR));
+    assert!(bdir.join("subdir/nested.txt").exists());
+}
+
+/// Regression: `rmdir` of a freshly created empty directory must succeed.
+/// The branch delta stores a directory as a real directory, so tombstoning it
+/// must remove that entry with a directory-aware primitive. A plain unlink
+/// fails with EISDIR, which surfaced as EIO on a branch path and ENOENT on a
+/// root path even though the tombstone had already been recorded.
+#[test]
+#[ignore]
+fn test_rmdir_fresh_directory_succeeds() {
+    let fix = TestFixture::new("rmdir_fresh");
+    fix.mount();
+
+    let ctl = fix.open_ctl();
+    let branch = unsafe { ioctl_create(ctl.as_raw_fd()) }.expect("CREATE");
+    let bdir = fix.branch_dir(&branch);
+
+    // Fresh directory through the mount root (root-path arm of remove_common).
+    fs::create_dir(fix.mnt.join("root_fresh")).unwrap();
+    fs::remove_dir(fix.mnt.join("root_fresh"))
+        .expect("rmdir of a fresh root directory must succeed");
+    assert!(!fix.mnt.join("root_fresh").exists());
+
+    // Fresh directory inside the branch (branch-path arm).
+    fs::create_dir(bdir.join("branch_fresh")).unwrap();
+    fs::remove_dir(bdir.join("branch_fresh"))
+        .expect("rmdir of a fresh branch directory must succeed");
+    assert!(!bdir.join("branch_fresh").exists());
+
+    // Nested: remove the emptied leaf, then its parent.
+    fs::create_dir_all(bdir.join("nested/inner")).unwrap();
+    fs::remove_dir(bdir.join("nested/inner")).expect("rmdir of fresh nested leaf");
+    fs::remove_dir(bdir.join("nested")).expect("rmdir of emptied parent");
+    assert!(!bdir.join("nested").exists());
+
+    // The recreated name must be usable again (tombstone revival).
+    fs::create_dir(bdir.join("branch_fresh")).unwrap();
+    assert!(bdir.join("branch_fresh").is_dir());
+}
+
 /// Modifying a base file (not main's delta) in a branch and committing
 /// should update the file visible at the mount root.
 #[test]
